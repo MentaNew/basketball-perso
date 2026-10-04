@@ -1,4 +1,4 @@
-"""Full ETL: scrape 1980-2025 from Basketball-Reference into PostgreSQL.
+"""Full ETL: scrape 1980 through the last completed season from Basketball-Reference into PostgreSQL.
 
 Progress is checkpointed per (season, step) in the `etl_checkpoint` table, and only after
 the step succeeds, so a failed step is retried on the next run.
@@ -13,10 +13,18 @@ Usage:
 import argparse
 import sys
 import traceback
+from datetime import date
 
 from etl import loader, scraper
 
-SEASONS = list(range(1980, 2026))
+
+def last_completed_season(today: date | None = None) -> int:
+    """Season Y (ending year) is over once the Finals end, so count it from July 1 of Y."""
+    today = today or date.today()
+    return today.year if today.month >= 7 else today.year - 1
+
+
+SEASONS = list(range(1980, last_completed_season() + 1))
 # standings must precede schedule: game-type classification needs each team's W+L
 STEPS = ["per_game", "advanced", "standings", "schedule"]
 

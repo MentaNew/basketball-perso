@@ -102,3 +102,28 @@ def test_missing_table_raises():
 def test_search_name_normalises_accents():
     assert parsers.search_name("Nikola Jokić") == "nikola jokic"
     assert parsers.clean_name("Michael Jordan*") == "Michael Jordan"
+
+
+@pytest.mark.parametrize("remarks,season,day,expected", [
+    ("at London, England", 2019, date(2019, 1, 17), True),
+    ("at Mexico City, Mexico", 2024, date(2023, 11, 9), True),
+    ("at Hartford, CT", 1990, date(1990, 3, 9), False),        # Celtics' second home
+    ("at Toronto, Canada (Maple Leaf Gardens)", 1998, date(1998, 4, 1), False),
+    ("at Kingdome", 1989, date(1989, 5, 14), False),
+    (None, 2020, date(2020, 8, 1), True),                       # Orlando bubble
+    (None, 2020, date(2020, 3, 1), False),
+    ("NBA Cup", 2025, date(2024, 11, 12), False),
+])
+def test_neutral_site_rule(remarks, season, day, expected):
+    assert parsers.is_neutral_site(remarks, season, day) is expected
+
+
+def test_schedule_has_neutral_flag():
+    df = parsers.parse_schedule(page("NBA_2024_games-october"), 2024)
+    assert df["neutral"].dtype == bool and not df["neutral"].any()
+
+
+def test_last_completed_season():
+    from etl.pipeline import last_completed_season
+    assert last_completed_season(date(2026, 10, 3)) == 2026
+    assert last_completed_season(date(2026, 3, 1)) == 2025

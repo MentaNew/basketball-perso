@@ -1,11 +1,38 @@
+# Secrets — keep only the template
 .env
+.env.*
+!.env.example
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Tooling caches & reports
 .pytest_cache/
 .ruff_cache/
+.coverage
+htmlcov/
 .ipynb_checkpoints/
-.DS_Store
-data/raw/
+
+# Data: raw HTML cache (~320 MB, re-creatable with `python -m etl.pipeline`)
+data/
+
+# Model artifacts (re-creatable with `python -m ml.<model> train`)
 models/*
 !models/.gitkeep
+mlruns/
+
+# Logs
 logs/
+*.log
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Leftover from the v1 pipeline
+.etl_checkpoint.json

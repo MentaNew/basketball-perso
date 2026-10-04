@@ -37,18 +37,25 @@ def main() -> int:
     print(f"Seasons with games: {len(loaded)} ({loaded[:1]}..{loaded[-1:]})")
 
     print("\nGames")
-    hw = query_df("""SELECT season, AVG(home_win::int) AS hw, COUNT(*) AS n
-                     FROM games WHERE game_type = 'regular' AND season = ANY(:seasons)
-                     GROUP BY 1 ORDER BY 1""", sql_seasons)
-    overall = query_df("""SELECT AVG(home_win::int) FROM games
-                          WHERE game_type = 'regular' AND season = ANY(:seasons)""",
+    home_games = "game_type = 'regular' AND NOT neutral AND season = ANY(:seasons)"
+    hw = query_df(f"""SELECT season, AVG(home_win::int) AS hw, COUNT(*) AS n
+                      FROM games WHERE {home_games} GROUP BY 1 ORDER BY 1""", sql_seasons)
+    overall = query_df(f"SELECT AVG(home_win::int) FROM games WHERE {home_games}",
                        sql_seasons).iat[0, 0]
-    r.check(0.53 <= overall <= 0.66, "overall regular-season home-win rate in [0.53, 0.66]",
+    r.check(0.53 <= overall <= 0.66, "overall home-win rate (regular, non-neutral) in [0.53, 0.66]",
             f"{overall:.3f}")
-    # 2021 had near-empty arenas, the 2020 bubble had no home court at all
-    bad = hw[(hw.hw < 0.50) & ~hw.season.isin([2020, 2021])]
-    r.check(bad.empty, "every season home-win rate ≥ 0.50 (2020/21 excepted)",
+    # 2021 was played in near-empty arenas
+    bad = hw[(hw.hw < 0.50) & (hw.season != 2021)]
+    r.check(bad.empty, "every season home-win rate ≥ 0.50 (2021 excepted)",
             ", ".join(f"{s}:{v:.2f}" for s, v in zip(bad.season, bad.hw, strict=True)))
+    unflagged = query_df("SELECT COUNT(*) FROM games WHERE neutral IS NULL "
+                         "AND season = ANY(:seasons)", sql_seasons).iat[0, 0]
+    r.check(unflagged == 0, "every game has a neutral flag", f"{unflagged} unflagged")
+    if 2020 in seasons:
+        bubble = query_df("""SELECT COUNT(*) FILTER (WHERE neutral) n, COUNT(*) total FROM games
+                             WHERE season = 2020 AND game_date >= '2020-07-30'""").iloc[0]
+        r.check(bubble.n == bubble.total > 0, "2020 bubble games flagged neutral",
+                f"{bubble.n}/{bubble.total}")
     untyped = query_df("SELECT COUNT(*) FROM games WHERE game_type IS NULL "
                        "AND season = ANY(:seasons)", sql_seasons).iat[0, 0]
     r.check(untyped == 0, "every game has a game_type", f"{untyped} untyped")

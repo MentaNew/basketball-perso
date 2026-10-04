@@ -40,17 +40,20 @@ c1, c2, c3 = st.columns([2, 2, 1])
 home = c1.selectbox("Home team", list(names), index=0)
 away = c2.selectbox("Away team", list(names), index=min(1, len(names) - 1))
 playoff = c3.toggle("Playoff game")
+neutral = c3.toggle("Neutral site", help="No home-court advantage (games abroad, 2020 bubble)")
 
 if home == away:
     st.warning("Pick two different teams.")
     st.stop()
 
-res = predict_winner(names[home], names[away], season, playoff)
+res = predict_winner(names[home], names[away], season, playoff, neutral)
 g1, g2 = st.columns(2)
 with g1:
-    st.plotly_chart(win_gauge(res["home_win_prob"], f"{home} (home)"), width="stretch")
+    st.plotly_chart(win_gauge(res["home_win_prob"], home if neutral else f"{home} (home)"),
+                    width="stretch")
 with g2:
-    st.plotly_chart(win_gauge(res["away_win_prob"], f"{away} (away)"), width="stretch")
+    st.plotly_chart(win_gauge(res["away_win_prob"], away if neutral else f"{away} (away)"),
+                    width="stretch")
 
 m = st.columns(3)
 with m[0]:

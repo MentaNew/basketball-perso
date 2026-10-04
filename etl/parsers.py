@@ -250,8 +250,28 @@ def parse_schedule(html: str, season: int) -> pd.DataFrame:
             "overtimes": rec.get("overtimes") or None,
             "attendance": int(_num(rec.get("attendance"))) if _num(rec.get("attendance")) else None,
             "remarks": rec.get("game_remarks") or None,
+            "neutral": is_neutral_site(rec.get("game_remarks"), season, game_date),
         })
     return pd.DataFrame(rows)
+
+
+BUBBLE_START = date(2020, 7, 30)        # 2020 restart in Orlando: no home crowds
+VENUE_RE = re.compile(r"^at [^,]+, ([^(]+)")
+
+
+def is_neutral_site(remarks: str | None, season: int, game_date: date) -> bool:
+    """True for games abroad (London, Mexico City, Tokyo, Paris, ...) and the 2020 bubble.
+
+    Domestic alternate venues ("at Hartford, CT" for the Celtics) and Canadian ones (Raptors
+    and Grizzlies home alternates) keep a real home edge in the data, so they stay home games.
+    """
+    if season == 2020 and game_date >= BUBBLE_START:
+        return True
+    m = VENUE_RE.match(remarks or "")
+    if not m:
+        return False
+    place = m.group(1).strip()
+    return not re.fullmatch(r"[A-Z]{2}", place) and place != "Canada"
 
 
 def _parse_date(game_id: str, text: str) -> date:

@@ -92,3 +92,14 @@ def test_archetype_names_follow_centroids():
         [[ARCHETYPE_TEMPLATES[n].get(c, 0.0) for c in F.SIMILARITY_COLS] for n in names],
         columns=F.SIMILARITY_COLS, index=[7, 3, 0])   # cluster ids deliberately scrambled
     assert name_clusters(cents) == {7: "Traditional Big", 3: "Floor General", 0: "3-and-D Wing"}
+
+
+def test_neutral_games_have_no_home_court():
+    games = toy_games().assign(neutral=False)
+    games.loc[0, "neutral"] = True
+    feats, _ = F.build_game_features(games)
+    assert feats.iloc[0].is_neutral == 1 and feats.iloc[1].is_neutral == 0
+    assert feats.iloc[0].elo_prob == 0.5               # equal ratings, no home edge
+    # the update also drops home court: the home winner gains more than with HCA
+    with_hca, _ = F.build_game_features(games.assign(neutral=False))
+    assert feats.iloc[1].away_elo > with_hca.iloc[1].away_elo   # SEA won game 0 at "home"

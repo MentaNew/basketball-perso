@@ -27,10 +27,16 @@ PCT_MIN_ATTEMPTS = {"fg_pct": ("fga", 5.0), "fg3_pct": ("fg3a", 2.0), "ft_pct": 
 def cached_player_list() -> pd.DataFrame:
     """bref_id, name and career span; the label disambiguates players sharing a name."""
     df = query_df("""
-        SELECT p.bref_id, p.name, MIN(s.season) first, MAX(s.season) last
+        SELECT p.bref_id, p.name, MIN(s.season) first, MAX(s.season) last,
+               string_agg(DISTINCT s.team_list, ',') teams
         FROM players p JOIN player_seasons s ON s.player_id = p.id AND s.is_primary
         GROUP BY 1, 2 ORDER BY 2""")
     df["label"] = df["name"] + " (" + (df["first"] - 1).astype(str) + "–" + df["last"].astype(str) + ")"
+    # Namesakes with the same span (e.g. two Tony Mitchells, both 2013-14) also need teams
+    dup = df["label"].duplicated(keep=False)
+    df.loc[dup, "label"] = df.loc[dup, "label"].str[:-1] + ", " + df.loc[dup, "teams"] + ")"
+    dup = df["label"].duplicated(keep=False)
+    df.loc[dup, "label"] = df.loc[dup, "label"] + " [" + df.loc[dup, "bref_id"] + "]"
     return df
 
 

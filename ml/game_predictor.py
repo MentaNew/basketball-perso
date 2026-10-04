@@ -124,7 +124,7 @@ def available_teams(season: int) -> list[str]:
 
 
 def predict_winner(home_team: str, away_team: str, season: int | None = None,
-                   playoff: bool = False) -> dict:
+                   playoff: bool = False, neutral: bool = False) -> dict:
     """Win probability for a hypothetical matchup, using each team's end-of-season state
     (Elo, form, net rating) for `season` (default: latest)."""
     b = _load()
@@ -134,7 +134,7 @@ def predict_winner(home_team: str, away_team: str, season: int | None = None,
     missing = [t for t in (home_team, away_team) if (season, t) not in snaps]
     if missing:
         raise ValueError(f"no data for {missing} in {season}")
-    row = matchup_features(snaps[(season, home_team)], snaps[(season, away_team)], playoff)
+    row = matchup_features(snaps[(season, home_team)], snaps[(season, away_team)], playoff, neutral)
     X = pd.DataFrame([row])[b["feature_cols"]]
     p = float(b["model"].predict_proba(X)[0, 1])
     margin = abs(p - 0.5)

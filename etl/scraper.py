@@ -76,8 +76,8 @@ def get_season_schedule(season: int, refresh: bool = False) -> pd.DataFrame:
     which handles lockouts and the 2020 bubble (october-2019 ... october-2020)."""
     index = _require(fetch_page(season, "games", refresh), season, "games")
     months = parsers.parse_schedule_months(index, season)
-    frames = [parsers.parse_schedule(index, season)]  # index page shows the first month
-    for slug in months:
+    frames = [parsers.parse_schedule(index, season)]  # index page shows the first month,
+    for slug in months[1:]:                             # so its own page isn't fetched again
         html = fetch_page(season, f"games-{slug}", refresh, sleep_s=5.0)
         if html is not None:
             frames.append(parsers.parse_schedule(html, season))

@@ -123,17 +123,18 @@ TEAM_FEATURES = ["elo", "w_pct", "net", "l10_w_pct", "l10_net", "prev_w_pct", "p
                  "gp", "rest", "b2b"]
 GAME_FEATURES = (
     [f"home_{f}" for f in TEAM_FEATURES] + [f"away_{f}" for f in TEAM_FEATURES]
-    + ["elo_diff", "net_diff", "w_pct_diff", "elo_prob", "is_playoff"]
+    + ["elo_diff", "net_diff", "w_pct_diff", "elo_prob", "is_playoff", "is_neutral"]
 )
 
 
-def matchup_features(home: dict, away: dict, is_playoff: bool) -> dict:
+def matchup_features(home: dict, away: dict, is_playoff: bool, neutral: bool = False) -> dict:
     row = {f"home_{k}": v for k, v in home.items()} | {f"away_{k}": v for k, v in away.items()}
     row["elo_diff"] = home["elo"] - away["elo"]
     row["net_diff"] = home["net"] - away["net"]
     row["w_pct_diff"] = home["w_pct"] - away["w_pct"]
-    row["elo_prob"] = elo_win_prob(home["elo"], away["elo"])
+    row["elo_prob"] = elo_win_prob(home["elo"], away["elo"], hca=0.0 if neutral else ELO_HCA)
     row["is_playoff"] = int(is_playoff)
+    row["is_neutral"] = int(neutral)
     return row
 
 
@@ -167,10 +168,12 @@ def build_game_features(games: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
                 st.start_season(g.season)
             last_abr[fr] = abr
         h, a = states[hf], states[af]
+        flag = getattr(g, "neutral", False)                # may be None/NaN if unflagged
+        neutral = isinstance(flag, (bool, np.bool_)) and bool(flag)
         rows.append(matchup_features(h.features(g.game_date), a.features(g.game_date),
-                                     g.game_type == "playoff"))
+                                     g.game_type == "playoff", neutral))
         margin = int(g.home_score - g.away_score)
-        h.elo, a.elo = elo_update(h.elo, a.elo, margin)
+        h.elo, a.elo = elo_update(h.elo, a.elo, margin, hca=0.0 if neutral else ELO_HCA)
         h.record(g.game_date, margin)
         a.record(g.game_date, -margin)
     if current_season is not None:

@@ -104,6 +104,7 @@ class Game(Base):
     overtimes = Column(Text)
     attendance = Column(Integer)
     remarks = Column(Text)
+    neutral = Column(Boolean)                      # abroad or 2020 bubble: no home crowd
     game_type = Column(Text)  # 'regular' | 'play_in' | 'playoff' | 'cup_final'
 
 

@@ -1,6 +1,7 @@
 # NBA Intelligence Platform
 
-An end-to-end ML project on 46 NBA seasons (1979-80 → 2024-25): a polite, resumable
+An end-to-end ML project on every NBA season from 1979-80 through the last completed one
+(currently 2025-26, 47 seasons): a polite, resumable
 Basketball-Reference scraper feeding PostgreSQL, three models, and a Streamlit dashboard.
 
 | Layer | What |
@@ -31,7 +32,7 @@ export PYTHONPATH=.
 python -m db.init_db                     # create tables (idempotent)
 
 python -m etl.pipeline --season 2024     # smoke test one season
-python -m etl.pipeline                   # full history 1980–2025 (~1 h, resumable)
+python -m etl.pipeline                   # 1980 → last completed season (~1 h, resumable)
 python -m etl.validate                   # data-quality gate — must pass before training
 
 python -m ml.game_predictor train
@@ -44,6 +45,10 @@ pytest && ruff check .
 
 ETL flags: `--start/--end` (season range), `--steps per_game advanced standings schedule`,
 `--force` (re-parse from the HTML cache, ignoring the checkpoint), `--refresh` (re-download).
+The season range ends at the last completed season: season `Y` counts as complete from
+July 1 of `Y`. New seasons are picked up automatically by a plain `python -m etl.pipeline`.
+After changing the schema, re-run `python -m db.init_db` (it applies the small migrations in
+`MIGRATIONS`).
 
 ## Data
 
@@ -57,30 +62,35 @@ on a 429.
 | `players` | `bref_id` | BRef player id (no more merging namesakes); `search_name` is accent-free |
 | `player_seasons` | `(player_id, season, team_abr)` | wide: per-game + advanced. Traded players have per-team rows plus `team_abr='TOT'`; `is_primary` marks the one row per player-season |
 | `team_seasons` | `(team_abr, season)` | standings for both conferences in every era, `franchise_id` links relocations (SEA→OKC, NJN→BRK…) |
-| `games` | `game_id` (BRef box-score id) | team abbreviations, `game_type` ∈ regular / play_in / playoff / cup_final |
+| `games` | `game_id` (BRef box-score id) | team abbreviations, `game_type` ∈ regular / play_in / playoff / cup_final, `neutral` (games abroad and the 2020 bubble) |
 | `etl_checkpoint` | `(season, step)` | written only when a step succeeds |
 
-## Results (first full run, 2026-10-02)
+## Results (run of 2026-10-03, data through 2025-26)
 
-The data covers 46 seasons, 55,132 games, 3,716 players and 1,284 team-seasons, and `etl.validate` passes all
-checks. The regular-season home-win rate is 60.4% (v1 had 39.4% because of inverted scores).
+The data covers 47 seasons, 56,454 games, 3,819 players and 1,314 team-seasons, and
+`etl.validate` passes all checks. The home-win rate in regular-season, non-neutral games is
+60.3% (v1 had 39.4% because of inverted scores).
 
-**Game predictor.** Held out on 2023-24 and 2024-25 (2,638 games):
+**Game predictor.** Held out on 2024-25 and 2025-26 (2,641 games):
 
 | model | accuracy | AUC | log-loss | Brier |
 |---|---|---|---|---|
-| XGBoost + isotonic | **0.651** | **0.722** | **0.617** | **0.214** |
-| Elo only | 0.644 | 0.716 | 0.626 | 0.218 |
-| always home | 0.546 | 0.500 | 0.697 | 0.252 |
+| XGBoost + isotonic (shipped) | 0.664 | 0.726 | 0.614 | 0.212 |
+| XGBoost raw | **0.670** | **0.730** | **0.610** | **0.210** |
+| Elo only | 0.661 | 0.724 | 0.619 | 0.215 |
+| always home | 0.550 | 0.500 | 0.695 | 0.251 |
 
-**Career LSTM.** Test MAE in real units on target seasons 2021–2025 (1,008 windows):
+On this holdout, isotonic calibration slightly *hurts* compared with the raw model (see
+`NEXT_STEPS.md`).
+
+**Career LSTM.** Test MAE in real units on target seasons 2021–2026 (1,221 windows):
 
 | model | pts | reb | ast | stl | blk | fg% |
 |---|---|---|---|---|---|---|
-| LSTM | 2.17 | 0.78 | 0.63 | 0.177 | 0.151 | 0.031 |
-| Ridge on the same window | **2.14** | **0.76** | **0.61** | **0.169** | **0.139** | **0.030** |
-| weighted avg (5/4/3/2) | 2.74 | 0.91 | 0.70 | 0.188 | 0.146 | 0.030 |
-| last season | 2.32 | 0.82 | 0.66 | 0.190 | 0.157 | 0.034 |
+| LSTM | 2.23 | 0.78 | 0.64 | 0.181 | 0.152 | 0.031 |
+| Ridge on the same window | **2.19** | **0.76** | **0.62** | **0.173** | **0.140** | **0.030** |
+| weighted avg (2/3/4/5) | 2.75 | 0.91 | 0.71 | 0.189 | 0.150 | 0.031 |
+| last season | 2.36 | 0.83 | 0.67 | 0.195 | 0.157 | 0.034 |
 
 The LSTM beats the naive baselines but not a linear model. With about 6k training windows,
 the sequence model doesn't earn its complexity yet. Worth trying: more inputs (advanced
@@ -115,7 +125,13 @@ stats, team context), predicting deltas with Ridge as a prior, or ensembling.
 - Month pages are discovered from each season's schedule index, which covers lockouts and the
   2020 bubble's July–October 2020 months.
 - Game types are inferred: a team's first W+L games (from standings) are its regular season,
-  BRef marks play-in games, and the season's last "NBA Cup" game is the non-counting final.
+  BRef marks play-in games, and the season's last "NBA Cup" / "In-Season Tournament" game is
+  the non-counting final.
+- Neutral sites: games abroad (from BRef's "at London, England"-style remarks) and the 2020
+  bubble restart are flagged `neutral`. Elo then drops home court, and the predictor has an
+  `is_neutral` input and a "Neutral site" toggle. Domestic and Canadian alternate venues
+  (Celtics in Hartford, Raptors at Maple Leaf Gardens) stay home games: their home-win rate
+  (57.8%) shows a real home edge.
 
 ## Layout
 
@@ -127,3 +143,6 @@ ml/      features.py (shared), game_predictor.py, similarity.py, player_lstm.py
 app/     Home.py, utils.py, pages/
 tests/   parser tests on tests/fixtures/*.html.gz, feature/leakage tests
 ```
+
+Guides: `PHASE1_ETL_GUIDE.md` … `PHASE5_STREAMLIT_APP_GUIDE.md` explain each layer;
+`NEXT_STEPS.md` lists what's open.

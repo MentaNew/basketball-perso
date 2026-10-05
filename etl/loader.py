@@ -1,11 +1,12 @@
-"""Idempotent upserts of parsed DataFrames into PostgreSQL.
+"""Idempotent loads of parsed DataFrames into PostgreSQL.
 
-All writes are `INSERT ... ON CONFLICT DO UPDATE`, so re-running a season refreshes it
-instead of silently keeping stale rows.
+Writes are `INSERT ... ON CONFLICT DO UPDATE`, and each load also deletes that season's rows
+that are no longer in the source, so re-running a season makes the DB match the pages
+exactly (no stale rows, no duplicates).
 """
 import numpy as np
 import pandas as pd
-from sqlalchemy import bindparam, func, select
+from sqlalchemy import delete, func, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 
 from db.connection import get_engine
@@ -54,10 +55,10 @@ def upsert_players(conn, df: pd.DataFrame, season: int) -> dict[str, int]:
         set_={
             "name": stmt.excluded.name,
             "search_name": stmt.excluded.search_name,
-            # keep the earliest estimate: the age-at-Feb-1 rule is off by one for some birthdays
-            "birth_year": stmt.excluded.birth_year,
+            # keep the earliest estimate (the age-at-Feb-1 rule is off by one for some
+            # birthdays); Postgres LEAST ignores NULLs
+            "birth_year": func.least(Player.birth_year, stmt.excluded.birth_year),
         },
-        where=(Player.birth_year.is_(None)) | (stmt.excluded.birth_year < Player.birth_year),
     )
     conn.execute(stmt, recs)
     ids = conn.execute(
@@ -74,68 +75,70 @@ def upsert_player_seasons(df: pd.DataFrame, season: int, kind: str) -> int:
         rows["age"] = rows["age"].astype("Int64")
         cols = ["player_id", "season", "team_abr", "team_list", "is_primary", "age", "pos", *stat_cols]
         update = ["team_list", "is_primary", "age", "pos", *stat_cols]
-        return _upsert(conn, PlayerSeason, _records(rows[cols]),
-                       ["player_id", "season", "team_abr"], update)
+        n = _upsert(conn, PlayerSeason, _records(rows[cols]),
+                    ["player_id", "season", "team_abr"], update)
+        if kind == "per_game":  # per_game defines the season's row set; advanced only fills it
+            keys = list(zip(rows["player_id"], rows["team_abr"], strict=True))
+            conn.execute(delete(PlayerSeason).where(
+                PlayerSeason.season == season,
+                tuple_(PlayerSeason.player_id, PlayerSeason.team_abr).not_in(keys)))
+        return n
 
 
 def upsert_standings(df: pd.DataFrame, season: int) -> int:
     rows = df.assign(season=season, franchise_id=df["team_abr"].map(franchise_of))
     cols = [c.name for c in TeamSeason.__table__.columns if c.name != "id"]
     with get_engine().begin() as conn:
-        return _upsert(conn, TeamSeason, _records(rows[cols]), ["team_abr", "season"],
-                       [c for c in cols if c not in ("team_abr", "season")])
+        n = _upsert(conn, TeamSeason, _records(rows[cols]), ["team_abr", "season"],
+                    [c for c in cols if c not in ("team_abr", "season")])
+        conn.execute(delete(TeamSeason).where(TeamSeason.season == season,
+                                              TeamSeason.team_abr.not_in(rows["team_abr"].tolist())))
+        return n
 
 
 def upsert_games(df: pd.DataFrame, season: int) -> int:
-    cols = [c.name for c in Game.__table__.columns if c.name != "game_type"]
-    with get_engine().begin() as conn:
-        n = _upsert(conn, Game, _records(df[cols]), ["game_id"],
-                    [c for c in cols if c != "game_id"])
-    classify_game_types(season)
-    return n
-
-
-def classify_game_types(season: int) -> None:
-    """Tag games as regular / play_in / playoff / cup_final.
-
-    BRef's schedule doesn't mark playoffs, so a team's first W+L games (from the
-    standings) are its regular season; 'Play-In Game' remarks mark the play-in.  The NBA
-    Cup final (the season's last 'NBA Cup' game, 2024+) doesn't count toward standings.
-    """
+    """Load a season's games and tag their game_type.  Needs that season's standings."""
     engine = get_engine()
-    games = pd.read_sql(
-        select(Game.game_id, Game.game_date, Game.home_team, Game.away_team, Game.remarks)
-        .where(Game.season == season).order_by(Game.game_date, Game.game_id), engine)
     standings = pd.read_sql(
         select(TeamSeason.team_abr, TeamSeason.w, TeamSeason.l).where(TeamSeason.season == season),
         engine)
-    if games.empty or standings.empty:
-        return
-    quota = dict(zip(standings.team_abr, standings.w + standings.l, strict=True))
-    remarks = games["remarks"].fillna("").str.lower()
-    cup_games = games.index[remarks.isin(["nba cup", "in-season tournament"])]
-    cup_final = cup_games[-1] if len(cup_games) else None
+    if standings.empty:
+        raise RuntimeError(f"no standings for {season}: run the standings step first")
+    quota = dict(zip(standings.team_abr, (standings.w + standings.l).astype(int), strict=True))
+    df = df.sort_values(["game_date", "game_id"], ignore_index=True)
+    df["game_type"] = infer_game_types(df, quota)
+    cols = [c.name for c in Game.__table__.columns]
+    with engine.begin() as conn:
+        n = _upsert(conn, Game, _records(df[cols]), ["game_id"], [c for c in cols if c != "game_id"])
+        conn.execute(delete(Game).where(Game.season == season,
+                                        Game.game_id.not_in(df["game_id"].tolist())))
+    return n
+
+
+def infer_game_types(games: pd.DataFrame, quota: dict[str, int]) -> list[str]:
+    """regular / play_in / playoff / cup_final for date-ordered `games` (pure function).
+
+    BRef's schedule doesn't mark playoffs, so a team's first W+L games (`quota`, from the
+    standings) are its regular season; 'Play-In Game' remarks mark the play-in.  The NBA Cup
+    final (the season's last 'NBA Cup' / 'In-Season Tournament' game, 2024+) doesn't count
+    toward the standings.
+    """
+    remarks = games["remarks"].fillna("").str.lower().tolist()
+    cup = [i for i, r in enumerate(remarks) if r in ("nba cup", "in-season tournament")]
+    cup_final = cup[-1] if cup else None
     played: dict[str, int] = {}
     types = []
-    for g in games.itertuples():
-        if remarks[g.Index].startswith("play-in"):
+    for i, (home, away) in enumerate(zip(games["home_team"], games["away_team"], strict=True)):
+        if remarks[i].startswith("play-in"):
             types.append("play_in")
-            continue
-        if g.Index == cup_final:
+        elif i == cup_final:
             types.append("cup_final")
-            continue
-        h, a = played.get(g.home_team, 0), played.get(g.away_team, 0)
-        if h < quota.get(g.home_team, 0) and a < quota.get(g.away_team, 0):
+        elif played.get(home, 0) < quota.get(home, 0) and played.get(away, 0) < quota.get(away, 0):
             types.append("regular")
-            played[g.home_team], played[g.away_team] = h + 1, a + 1
+            played[home], played[away] = played.get(home, 0) + 1, played.get(away, 0) + 1
         else:
             types.append("playoff")
-    table = Game.__table__
-    stmt = (table.update().where(table.c.game_id == bindparam("gid"))
-            .values(game_type=bindparam("gtype")))
-    with engine.begin() as conn:
-        conn.execute(stmt, [{"gid": gid, "gtype": t}
-                            for gid, t in zip(games.game_id, types, strict=True)])
+    return types
 
 
 # ---------------------------------------------------------------- checkpoint

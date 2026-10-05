@@ -3,7 +3,8 @@
 Build the data foundation: scrape every NBA season since 1979-80 from Basketball-Reference,
 store it in PostgreSQL, and **prove it is correct** before any model touches it.
 
-Files: `db/`, `etl/`, `tests/test_parsers.py`, `tests/fixtures/`.
+Files: `db/`, `etl/`, `tests/test_parsers.py`, `tests/test_game_types.py`,
+`tests/test_scraper.py`, `tests/test_loader.py`, `tests/fixtures/`.
 
 > This guide replaces the original Phase 1 guide. That version's code swapped home and away
 > scores, keyed players by name, missed most standings and checkpointed failed seasons as
@@ -25,10 +26,16 @@ CREATE USER nba_user WITH PASSWORD 'yourpassword';
 CREATE DATABASE nba_platform_v2 OWNER nba_user;
 ```
 
+```sql
+-- optional: a throwaway DB for the loader tests (wiped on every test run)
+CREATE DATABASE nba_platform_test OWNER nba_user;
+```
+
 `.env` (git-ignored; template in `.env.example`):
 
 ```
 DATABASE_URL=postgresql://nba_user:yourpassword@localhost:5432/nba_platform_v2
+TEST_DATABASE_URL=postgresql://nba_user:yourpassword@localhost:5432/nba_platform_test
 ```
 
 ---
@@ -50,16 +57,20 @@ export PYTHONPATH=.                    # every command runs as `python -m packag
 db/
   models.py       SQLAlchemy tables: the single source of truth for the schema
   connection.py   get_engine() (cached, pool_pre_ping) and query_df(sql, params)
-  init_db.py      create tables + apply MIGRATIONS (idempotent)
+  init_db.py      create tables + apply MIGRATIONS + (re)create VIEWS (idempotent)
 etl/
   scraper.py      network + HTML cache. The only file that talks to the internet
   parsers.py      pure HTML → DataFrame functions. No network, no DB, fully tested
-  loader.py       idempotent upserts + game-type inference + checkpoint helpers
+  loader.py       idempotent loads + game-type inference + checkpoint helpers
   pipeline.py     CLI orchestrator
   validate.py     data-quality gate
   teams.py        franchise map (SEA → OKC, …)
 tests/
-  fixtures/*.html.gz   real BRef pages used by the parser tests
+  fixtures/*.html.gz   real BRef pages used by the parser and loader tests
+  test_parsers.py      HTML → DataFrame on the fixtures
+  test_game_types.py   regular / play-in / playoff / Cup-final inference
+  test_scraper.py      cache, 404 memory, 429 handling (network faked)
+  test_loader.py       idempotency and refresh against TEST_DATABASE_URL
 ```
 
 The key split is **scraper vs. parsers**. Network code is slow, flaky and rate-limited.
@@ -81,6 +92,8 @@ python -m db.init_db          # create tables and apply migrations; safe to re-r
 | `team_seasons` | unique `(team_abr, season)` | `franchise_id`, `full_name`, `conference`, `division`, W/L, `ps_g`/`pa_g`, `srs`, `made_playoffs` |
 | `games` | `game_id` (BRef box-score id, e.g. `202310240DEN`) | away/home abbreviation + name + score, `home_win`, `overtimes`, `attendance`, `remarks`, `game_type`, `neutral` |
 | `etl_checkpoint` | `(season, step)` | `rows`, `completed_at` |
+| `teams` *(view)* | `team_abr` | `franchise_id`, latest `full_name`, `first_season`, `last_season` |
+| `franchises` *(view)* | `franchise_id` | `current_abr`, current `full_name`, `first_season`, `last_season`, `n_abbreviations` |
 
 Design decisions:
 - **`season` is the ending year:** `2024` means 2023-24.
@@ -96,6 +109,10 @@ Design decisions:
 - **Schema changes:** add the column in `models.py` **and** an `ALTER TABLE … ADD COLUMN IF NOT
   EXISTS` line to `MIGRATIONS` in `init_db.py`, because `create_all` never alters an existing
   table.
+- **Lookups are views, not tables.** `teams` and `franchises` (blueprint §7.5) are derived from
+  `team_seasons` by `init_db`, so they can never disagree with it. Example:
+  `SELECT * FROM teams WHERE franchise_id = 'OKC'` returns `SEA` (1980–2008) and `OKC` (2009–).
+  The app's franchise picker reads `franchises`.
 
 ---
 
@@ -108,7 +125,8 @@ fetch_page(season, page, refresh=False, sleep_s=4.0) -> str | None
 ```
 
 - **Cache first.** A cached page is never re-downloaded unless `refresh=True`. A full re-parse
-  of 47 seasons therefore takes seconds and makes no requests.
+  of 47 seasons (`python -m etl.pipeline --force`) makes no requests and takes about 1.5 min,
+  versus about 1 h for a real scrape.
 - **Politeness.** BRef allows about 20 requests/min and bans offenders for hours. The scraper
   sleeps 4 s after every request (5 s for schedule months), which is about 12 requests/min.
 - **Rate limit.** A `429` raises `RateLimited`, and the pipeline stops immediately instead of
@@ -179,18 +197,28 @@ row into `{data-stat: text}` plus three extras: `@href` (link), `@csk` (sort key
 
 ## Step 6 — Loading (`etl/loader.py`)
 
-Every write is `INSERT … ON CONFLICT (key) DO UPDATE`. Re-running a season **refreshes** it.
-v1 used `DO NOTHING`, which silently kept stale or broken rows.
+Every load is a **refresh of that season**:
+- `INSERT … ON CONFLICT (key) DO UPDATE` writes the new values. v1 used `DO NOTHING`, which
+  silently kept stale or broken rows.
+- Rows of that season that are **no longer in the source** are deleted in the same
+  transaction (a game whose id BRef corrected, a re-attributed trade row). Without this,
+  upserts alone would leave them behind forever.
 
 ```python
-upsert_player_seasons(df, season, kind)   # upserts players by bref_id, then the stat columns of `kind`
+upsert_player_seasons(df, season, kind)   # players by bref_id, then the stat columns of `kind`;
+                                          # the per_game step defines the season's row set
 upsert_standings(df, season)              # adds franchise_id via etl/teams.py
-upsert_games(df, season)                  # then classify_game_types(season)
+upsert_games(df, season)                  # tags game_type, then writes; raises if the
+                                          # season's standings aren't loaded yet
 ```
 
-### Game-type inference (`classify_game_types`)
+Player names are always updated (BRef corrects spellings). `birth_year` keeps the earliest
+estimate via `LEAST`.
 
-BRef's schedule does not mark playoff games, so the type is inferred per season:
+### Game-type inference (`infer_game_types`)
+
+BRef's schedule does not mark playoff games, so the type is inferred per season. It's a pure
+function of the date-ordered games and each team's W+L quota (`tests/test_game_types.py`):
 
 1. `remarks` starting with "Play-In" → `play_in`.
 2. The season's last `NBA Cup` / `In-Season Tournament` game is the Cup final (2024+). It
@@ -198,7 +226,8 @@ BRef's schedule does not mark playoff games, so the type is inferred per season:
 3. Walk the remaining games by date. A game is `regular` while **both** teams are still under
    their W+L total from the standings; everything after → `playoff`.
 
-This is why the pipeline runs **standings before schedule**.
+This is why the pipeline runs **standings before schedule**. Running the schedule step alone
+for a season without standings fails loudly, and that step is not checkpointed.
 
 ### Franchises (`etl/teams.py`)
 
@@ -240,6 +269,7 @@ straight into a model.
 
 | Check | Catches |
 |---|---|
+| All 4 steps checkpointed for every season `1980 … last_completed_season()`; every season has games, standings and players | A season that silently never loaded |
 | Home-win rate (regular, non-neutral games) in [0.53, 0.66] overall, ≥ 0.50 per season except 2021 | Inverted scores (v1: 0.394) |
 | Every game has a `game_type` and a `neutral` flag; all 2020 bubble games are neutral | Missed inference / migration |
 | Standings W/L == W/L recomputed from regular-season games | Cup final or playoff misclassification, missing games |
@@ -247,6 +277,9 @@ straight into a model.
 | 1999 = 50 and 2012 = 66 games per team | Lockout handling |
 | No `UNK` team, every player has a `bref_id`, exactly one primary row per player-season | Team column renames, identity bugs |
 | 250–700 primary player rows per season; advanced stats wherever minutes were played | Partial loads |
+| **Box totals:** Σ(player PPG × games) per team == PS/G × games (±1%; real max error 0.27%) | Missing players, wrong team attribution |
+| Traded players: TOT games == sum of their per-team games | Broken `2TM/3TM` handling |
+| 30 franchises, all active; every retired abbreviation maps to a franchise | A relocation missing from `etl/teams.py` |
 | Spot check: LAL 107 @ DEN 119 on 2023-10-24 | The exact game v1 stored backwards |
 
 Add a spot check (`KNOWN_GAMES`) whenever you verify a result against a box score.
@@ -261,12 +294,22 @@ python -m etl.pipeline --season 2026     # smoke test one season (~1 min)
 python -m etl.validate --seasons 2026
 python -m etl.pipeline                   # everything else (~1 h; Ctrl+C-safe, resumes)
 python -m etl.validate
-pytest tests/test_parsers.py -q
+pytest -q                                # parsers, game types, scraper, loader (needs TEST_DATABASE_URL)
 ```
 
 ---
 
-## Tests (`tests/test_parsers.py`)
+## Tests
+
+| File | Needs | Covers |
+|---|---|---|
+| `test_parsers.py` | nothing | every parser on real pages |
+| `test_game_types.py` | nothing | quota logic, play-in, Cup final (both labels), unknown teams |
+| `test_scraper.py` | nothing (network faked) | cache hits, `--refresh`, `.404` memory, 429 → `RateLimited` with nothing cached |
+| `test_loader.py` | `TEST_DATABASE_URL` (skipped otherwise) | loading twice changes nothing; per-game + advanced fill one wide row; Dončić's TOT/DAL/LAL rows; name corrections propagate; rows dropped from the source are deleted; games need standings; the franchise views |
+
+`test_loader.py` drops and recreates the schema in the test DB, and refuses to run if
+`TEST_DATABASE_URL` equals `DATABASE_URL`.
 
 The parsers run against real, gzipped BRef pages in `tests/fixtures/`: 1985 and 2025
 per-game, 2025 advanced, 1990 and 2025 standings, 2023-24 October and April schedules, and
@@ -286,7 +329,9 @@ the network.
 |---|---|---|
 | `RateLimited: 429` | Too many requests | Wait (BRef bans can last hours), then re-run; the checkpoint resumes. Raise `SLEEP_S` if it recurs |
 | `TableNotFound` | BRef renamed a table id or layout | Check the cached page (`grep -o 'table[^>]*id="[^"]*"' data/raw/Y/page.html`) and add the new id or key to the parser |
-| `standings W/L ≠ games` in validate | A non-counting game was classified as regular (new tournament format?) | Look at that season's `remarks` and extend `classify_game_types` |
+| `standings W/L ≠ games` in validate | A non-counting game was classified as regular (new tournament format?) | Look at that season's `remarks`, extend `infer_game_types` and add a case to `test_game_types.py` |
+| `RuntimeError: no standings for Y` | Schedule step run before standings | `python -m etl.pipeline --season Y` (runs the steps in order) |
+| `box totals` fails for one team-season | A player row missing or attributed to the wrong team | Compare that team's rows with the BRef team page; usually a parser key change |
 | New column missing in the DB | `create_all` doesn't alter tables | Add it to `MIGRATIONS` and run `python -m db.init_db` |
 | `psycopg2` install fails | Missing libpq | `brew install libpq` |
 
@@ -303,8 +348,7 @@ SELECT game_type, neutral, COUNT(*) FROM games GROUP BY 1, 2 ORDER BY 1, 2;
 SELECT p.name, s.team_list, s.pts, s.per FROM player_seasons s JOIN players p ON p.id = s.player_id
 WHERE s.season = 2026 AND s.is_primary ORDER BY s.pts DESC LIMIT 10;
 
-SELECT franchise_id, string_agg(DISTINCT team_abr, ',') FROM team_seasons
-GROUP BY 1 HAVING COUNT(DISTINCT team_abr) > 1;            -- relocations
+SELECT * FROM franchises WHERE n_abbreviations > 1;          -- relocations
 
 SELECT * FROM etl_checkpoint ORDER BY completed_at DESC LIMIT 8;
 ```

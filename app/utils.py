@@ -45,8 +45,8 @@ def cached_team_list(season: int | None = None) -> pd.DataFrame:
     if season:
         return query_df("SELECT team_abr, full_name FROM team_seasons WHERE season = :s "
                         "ORDER BY full_name", {"s": season})
-    return query_df("""SELECT DISTINCT ON (franchise_id) franchise_id, team_abr, full_name
-                       FROM team_seasons ORDER BY franchise_id, season DESC""")
+    return query_df("""SELECT franchise_id, current_abr AS team_abr, full_name
+                       FROM franchises ORDER BY full_name""")
 
 
 @st.cache_data(ttl=3600)

@@ -7,6 +7,7 @@ import argparse
 import sys
 
 from db.connection import query_df
+from etl.pipeline import SEASONS, STEPS
 
 # Known results used as spot checks: (game_id, away, home, away_score, home_score).
 # Add more as you verify them against box scores.
@@ -35,6 +36,22 @@ def main() -> int:
     seasons = [s for s in (args.seasons or loaded) if s in loaded]
     sql_seasons = {"seasons": seasons}
     print(f"Seasons with games: {len(loaded)} ({loaded[:1]}..{loaded[-1:]})")
+
+    print("\nCompleteness")
+    expected = args.seasons or SEASONS
+    done = query_df("SELECT season, step FROM etl_checkpoint")
+    done = set(zip(done.season, done.step, strict=True))
+    missing = [f"{s}:{st}" for s in expected for st in STEPS if (s, st) not in done]
+    r.check(not missing, f"all {len(STEPS)} ETL steps checkpointed for {len(expected)} seasons "
+            f"({expected[0]}–{expected[-1]})", ", ".join(missing[:8]) + (" …" if len(missing) > 8 else ""))
+    present = query_df("""SELECT s.season,
+                                 EXISTS (SELECT 1 FROM games g WHERE g.season = s.season) games,
+                                 EXISTS (SELECT 1 FROM team_seasons t WHERE t.season = s.season) teams,
+                                 EXISTS (SELECT 1 FROM player_seasons p WHERE p.season = s.season) players
+                          FROM unnest(CAST(:seasons AS int[])) AS s(season)""", {"seasons": list(expected)})
+    empty = present[~(present.games & present.teams & present.players)]
+    r.check(empty.empty, "every season has games, standings and players",
+            ", ".join(map(str, empty.season)))
 
     print("\nGames")
     home_games = "game_type = 'regular' AND NOT neutral AND season = ANY(:seasons)"
@@ -103,6 +120,34 @@ def main() -> int:
                          WHERE season = ANY(:seasons) AND mp_total IS NULL AND g > 0""",
                       sql_seasons).iat[0, 0]
     r.check(no_adv == 0, "advanced stats present wherever minutes were played", f"{no_adv} rows")
+
+    print("\nBox totals")
+    # Σ (player PPG × games) over a team's per-team rows must equal PS/G × games from the
+    # standings.  Rounding of per-game averages keeps the real error under 0.3%.
+    box = query_df("""
+        WITH p AS (SELECT season, team_abr, SUM(pts * g) pts FROM player_seasons
+                   WHERE team_abr <> 'TOT' AND season = ANY(:seasons) GROUP BY 1, 2)
+        SELECT t.season, t.team_abr, p.pts AS player_pts, t.ps_g * (t.w + t.l) AS team_pts
+        FROM team_seasons t LEFT JOIN p USING (season, team_abr)
+        WHERE t.season = ANY(:seasons)""", sql_seasons)
+    box["err"] = (box.player_pts / box.team_pts - 1).abs()
+    off = box[box.err.isna() | (box.err > 0.01)]
+    r.check(off.empty, "player points add up to team points (±1%) for every team-season",
+            f"max err {box.err.max():.2%}" if off.empty else off.head(5).to_dict("records"))
+    multi = query_df("""SELECT COUNT(*) FROM player_seasons t
+                        WHERE t.team_abr = 'TOT' AND season = ANY(:seasons) AND t.g <> (
+                            SELECT SUM(x.g) FROM player_seasons x WHERE x.player_id = t.player_id
+                            AND x.season = t.season AND x.team_abr <> 'TOT')""", sql_seasons).iat[0, 0]
+    r.check(multi == 0, "traded players: TOT games == sum of per-team games", f"{multi} mismatches")
+
+    print("\nFranchises")
+    fr = query_df("SELECT * FROM franchises")
+    r.check(len(fr) == 30 and (fr.last_season == fr.last_season.max()).all(),
+            "30 franchises, all active in the latest season", f"{len(fr)} franchises")
+    unmapped = query_df("""SELECT team_abr FROM teams WHERE last_season < (SELECT MAX(season) FROM games)
+                           AND franchise_id = team_abr""")
+    r.check(unmapped.empty, "every retired abbreviation maps to a current franchise (etl/teams.py)",
+            ", ".join(unmapped.team_abr))
 
     print("\nSpot checks")
     for gid, away, home, a_pts, h_pts in KNOWN_GAMES:

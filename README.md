@@ -64,6 +64,7 @@ on a 429.
 | `team_seasons` | `(team_abr, season)` | standings for both conferences in every era, `franchise_id` links relocations (SEA→OKC, NJN→BRK…) |
 | `games` | `game_id` (BRef box-score id) | team abbreviations, `game_type` ∈ regular / play_in / playoff / cup_final, `neutral` (games abroad and the 2020 bubble) |
 | `etl_checkpoint` | `(season, step)` | written only when a step succeeds |
+| `teams`, `franchises` *(views)* | `team_abr` / `franchise_id` | abbreviation → franchise lookup with name and season span, derived from `team_seasons` |
 
 ## Results (run of 2026-10-03, data through 2025-26)
 
@@ -141,7 +142,8 @@ etl/     scraper.py (fetch + cache), parsers.py (pure HTML→DataFrame), loader.
          pipeline.py (CLI), validate.py (quality gate), teams.py (franchise map)
 ml/      features.py (shared), game_predictor.py, similarity.py, player_lstm.py
 app/     Home.py, utils.py, pages/
-tests/   parser tests on tests/fixtures/*.html.gz, feature/leakage tests
+tests/   parsers, game types, scraper (faked network), loader (needs TEST_DATABASE_URL),
+         feature/leakage tests
 ```
 
 Guides: `PHASE1_ETL_GUIDE.md` … `PHASE5_STREAMLIT_APP_GUIDE.md` explain each layer;

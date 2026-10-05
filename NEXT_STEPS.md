@@ -2,7 +2,7 @@
 
 Status as of 2026-10-03: Phases 1–5 are built and verified. 47 seasons (1980–2026) are
 loaded, `etl.validate` passes, all three models are trained, the six app pages render,
-30 tests pass and ruff is clean.
+46 tests pass and ruff is clean.
 
 Below is everything still open, in priority order. Each item names the files to touch and
 what "done" means. Phase guides: `PHASE1_ETL_GUIDE.md` … `PHASE5_STREAMLIT_APP_GUIDE.md`.
@@ -21,6 +21,11 @@ what "done" means. Phase guides: `PHASE1_ETL_GUIDE.md` … `PHASE5_STREAMLIT_APP
   `etl.validate` checks the flag.
 - **Wasted request removed.** A season's first month page is no longer fetched twice
   (verified identical to the index page for all 46 cached seasons).
+- **Phase 1 gaps closed (2026-10-05).** `teams` / `franchises` lookup views (blueprint §7.5);
+  pure, tested `infer_game_types`; loads now delete rows that vanished from the source;
+  player-name corrections propagate (a `WHERE` clause used to block them); loader
+  integration tests (§9) and scraper tests; `etl.validate` checks completeness, box totals
+  and franchises.
 - **Player picker bug.** Namesakes with identical career spans (the two 2013-14 Tony
   Mitchells) had identical labels. Labels now add the teams.
 
@@ -91,11 +96,11 @@ Options, cheapest first:
 `.github/workflows/ci.yml` running `ruff check .` and `pytest` on Python 3.11. The current tests
 use only the saved HTML fixtures and toy data, so **no database is needed in CI**.
 
-### 7. Integration tests
-- **Loader idempotency:** run the 2025 fixtures through `upsert_*` twice against a throwaway
-  database (`TEST_DATABASE_URL`, skipped when unset). Row counts must not change.
-- **App smoke test:** move the headless `AppTest` checks (Phase 5 guide, Step 3) into
-  `tests/test_app.py`, marked `@pytest.mark.integration` because they need the DB and models.
+### 7. App integration test
+The loader integration tests are done (`tests/test_loader.py`, against `TEST_DATABASE_URL`).
+Still open: move the headless `AppTest` checks (Phase 5 guide, Step 3) into
+`tests/test_app.py`, marked `@pytest.mark.integration` because they need the real DB and
+trained models.
 
 ### 8. Model metrics log
 Every `train()` appends to `models/metrics.jsonl`: timestamp, git SHA, data row counts and

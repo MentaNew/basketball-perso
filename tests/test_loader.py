@@ -33,19 +33,10 @@ def db():
     real = os.environ.get("DATABASE_URL")
     os.environ["DATABASE_URL"] = TEST_URL
     connection.get_engine.cache_clear()
-    from sqlalchemy import text
-
-    from db.init_db import MIGRATIONS, VIEWS
-    from db.models import Base
+    from db.init_db import init_db
 
     engine = connection.get_engine()
-    with engine.begin() as conn:
-        conn.execute(text("DROP VIEW IF EXISTS franchises, teams"))
-    Base.metadata.drop_all(engine)
-    Base.metadata.create_all(engine)
-    with engine.begin() as conn:
-        for stmt in MIGRATIONS + VIEWS:
-            conn.execute(text(stmt))
+    init_db(engine, drop=True)
     yield connection
     engine.dispose()
     connection.get_engine.cache_clear()

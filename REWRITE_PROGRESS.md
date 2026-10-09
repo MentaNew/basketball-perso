@@ -13,31 +13,33 @@ Status log for the two-axis plan agreed on 2026-10-05. **Read this first when co
 
 ---
 
-## Where we are (last updated 2026-10-05)
+## Where we are (last updated 2026-10-09)
 
 - **Git:** branch `rewrite/minimal`. The pre-rewrite code is tagged `v0-reference` (commit
   `2f419c1`, which is also `main`).
 - **Databases:**
   - `nba_platform_v2` is the **reference**, with full data 1980–2026. Leave it untouched; it's
     what the rewrite is compared against.
-  - `nba_platform_l0` is the rewrite's DB. Its schema exists (module 1) but it has **no data
-    yet**.
+  - `nba_platform_l0` is the rewrite's DB, with all 47 seasons loaded by the rewritten
+    pipeline (module 5) and **identical** to the reference.
   - `nba_platform_test` is wiped by `tests/test_loader.py` on every run.
   - `nba_platform` is the old v1 data. Don't use it.
-- **`.env`:** `DATABASE_URL` still points at `nba_platform_v2`. Switch it to `nba_platform_l0`
-  at module 5, when the pipeline first loads data into it.
+- **`.env`:** `DATABASE_URL` now points at `nba_platform_l0` (switched at module 5). The
+  reference URL is kept as a comment line above it.
+- **Models (`models/*.pkl`)** were trained on `nba_platform_v2` data by the old code. That's
+  fine until modules 7–10 retrain them.
 
 ### L0 module checklist
 
 | # | Module | Status |
 |---|---|---|
 | 0 | Setup: commit, tag `v0-reference`, branch, create `nba_platform_l0` | ✅ done |
-| 1 | `db/models.py`, `db/init_db.py` | ✅ rewritten and verified, **⚠️ NOT COMMITTED YET** |
-| 2 | `etl/parsers.py` (280 → ~180 lines) | ⏭ **next** |
-| 3 | `etl/scraper.py` (merge per-game + advanced into `get_players`) | ⏳ |
-| 4 | `etl/loader.py` (replace-season pattern, `to_sql`; remove `PER_GAME_COLS`/`ADVANCED_COLS` from models) | ⏳ |
-| 5 | `etl/pipeline.py` (3 steps: players → standings → schedule) + first load into `nba_platform_l0` | ⏳ |
-| 6 | `etl/validate.py` (declarative `CHECKS = {name: SQL returning bad rows}`) | ⏳ |
+| 1 | `db/models.py`, `db/init_db.py` | ✅ committed (`9fc346f`) |
+| 2 | `etl/parsers.py` (280 → 235 lines) | ✅ verified, **⚠️ NOT COMMITTED YET** |
+| 3 | `etl/scraper.py` (merged `get_players`) | ✅ verified, **⚠️ NOT COMMITTED YET** |
+| 4 | `etl/loader.py` (replace-season pattern; column lists removed from models) | ✅ verified, **⚠️ NOT COMMITTED YET** |
+| 5 | `etl/pipeline.py` (3 steps) + first full load into `nba_platform_l0` | ✅ verified, **⚠️ NOT COMMITTED YET** |
+| 6 | `etl/validate.py` (declarative `CHECKS = {name: SQL returning bad rows}`) | ⏭ **next** |
 | 7 | `ml/features.py` (tidy; guarantee the `neutral` column) | ⏳ |
 | 8 | `ml/game_predictor.py` (ship raw XGBoost, drop calibration) | ⏳ |
 | 9 | `ml/similarity.py` (light tidy) | ⏳ |
@@ -64,22 +66,78 @@ Status log for the two-axis plan agreed on 2026-10-05. **Read this first when co
   2. Why must the views be dropped before `drop_all()` and created after `create_all()`?
   3. What breaks in the `franchises` view without the `teams.` prefix on `last_season`?
 
+### Modules 2–5 — what was done (2026-10-09)
+
+**Module 2, `etl/parsers.py`.** Every fallback was measured on all 47 cached seasons first:
+- Removed, because they fired **0 times**: the HTML-comment table search, the old-layout
+  aliases, the `confs_standings` fallback, the box-score/date-text game-id fallback,
+  `drop_duplicates`, and the unused `table_ids`/`_first` helpers.
+- Kept, because they fire: skipping rows without a player id (**94** "League Average" rows).
+  Skipping unplayed games is also kept, since BRef lists future games with blank scores.
+- Helpers renamed for clarity: `read_row`, `to_float`, `team_from_link`.
+- **Verified:** output identical to the `v0-reference` parser on all **588 cached pages**.
+
+**Module 3, `etl/scraper.py`.**
+- `get_players` returns per-game and advanced stats as one wide frame, via the pure
+  `parsers.merge_player_tables`: an outer join with `validate="one_to_one"`. Both pages were
+  checked to list identical rows, with identical name/age/pos/primary/team_list, in every
+  season.
+- Renames: `get_schedule` (was `get_season_schedule`) and `fetch_required` (was `_require`).
+
+**Module 4, `etl/loader.py`.**
+- **Replace-season pattern:** one transaction that runs `DELETE … WHERE season = ?`, then
+  `DataFrame.to_sql`. This removes `_records`, `_upsert`, the stale-row deletes and the
+  two-step partial rows.
+- Players are still upserted by `bref_id`.
+- Functions renamed `load_players`, `load_standings` and `load_games`.
+- `PER_GAME_COLS`/`ADVANCED_COLS` are removed from `db/models.py`.
+
+**Module 5, `etl/pipeline.py`.**
+- `STEPS = {name: (extract, load)}` dispatch table with 3 steps: players → standings →
+  schedule.
+- Same flags and checkpoint behaviour. A 429 stops everything with exit code 2.
+
+**Verification:**
+- Full load of 47 seasons into `nba_platform_l0` from the cache: 90 s, 0 failures, no network.
+- Per-table md5 over natural keys is **identical** to `nba_platform_v2` for players
+  (3,819), player_seasons (25,349), team_seasons (1,314), games (56,454) and both views.
+- `etl.validate` passes all checks.
+- Re-running 2026 changed nothing (idempotent).
+- 46 tests pass, ruff is clean.
+
+**Self-check questions:**
+1. The loader deletes a season, then inserts it. What guarantees we never end up with a
+   season that is deleted but not re-inserted, for example if the insert crashes?
+2. Why are players upserted instead of following the replace-season pattern like the other
+   tables?
+3. The merge uses `how="outer"` plus `validate="one_to_one"` even though both pages always
+   agree. What would an inner join silently do if BRef ever listed a player on only one
+   page?
+4. The parser rewrite was verified by comparing against the old parser rather than only by
+   unit tests. What does that "differential testing" catch that the fixture tests can't?
+
+**Not committed yet.** Suggested commits:
+```bash
+git add etl/parsers.py && git commit -m "L0 module 2: evidence-driven parser simplification (parity on 588 pages)"
+git add -A etl db tests REWRITE_PROGRESS.md && git commit -m "L0 modules 3-5: merged players step, replace-season loader, 3-step pipeline"
+```
+`.claude/settings.json` (enables a Claude Code plugin) is untracked. Commit it if you want the
+plugin setting shared, or add `.claude/` to `.gitignore`.
+
 ---
 
 ## How to resume
 
 ```bash
 cd ~/Projects/personal_projects/basketball
-git switch rewrite/minimal && git status          # expect module 1's 3 files modified, or committed
-# if not committed yet:
-git add -A && git commit -m "L0 module 1: explicit schema, init_db() function, drop hand-rolled migrations"
+git switch rewrite/minimal && git status          # modules 2-5 may still be uncommitted (see above)
 
 conda activate nba                                # or /opt/miniconda3/envs/nba/bin/python
 export PYTHONPATH=.
 pytest -q && ruff check .                         # expect 46 passed, all checks passed
 ```
 
-Then ask Claude: **"continue the rewrite with module 2 (etl/parsers.py)"**.
+Then ask Claude: **"continue the rewrite with module 6 (etl/validate.py)"**.
 
 ---
 

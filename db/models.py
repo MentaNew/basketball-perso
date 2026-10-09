@@ -107,19 +107,6 @@ class PlayerSeason(Base):
     vorp = Column(Float)
 
 
-# Which stat columns each page fills. Used by the current loader; module 4 of the rewrite
-# loads both pages as one merged row and removes these lists.
-PER_GAME_COLS = [
-    "g", "gs", "mp", "fg", "fga", "fg_pct", "fg3", "fg3a", "fg3_pct", "ft", "fta",
-    "ft_pct", "efg_pct", "orb", "drb", "reb", "ast", "stl", "blk", "tov", "pf", "pts",
-]
-ADVANCED_COLS = [
-    "mp_total", "per", "ts_pct", "fg3a_rate", "fta_rate", "orb_pct", "drb_pct", "trb_pct",
-    "ast_pct", "stl_pct", "blk_pct", "tov_pct", "usg_pct", "ows", "dws", "ws", "ws_per_48",
-    "obpm", "dbpm", "bpm", "vorp",
-]
-
-
 class TeamSeason(Base):
     """Final standings: one row per team per season."""
     __tablename__ = "team_seasons"

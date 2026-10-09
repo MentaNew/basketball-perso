@@ -1,14 +1,19 @@
-"""Full ETL: scrape 1980 through the last completed season from Basketball-Reference into PostgreSQL.
+"""ETL command line: scrape seasons from Basketball-Reference into PostgreSQL.
 
-Progress is checkpointed per (season, step) in the `etl_checkpoint` table, and only after
-the step succeeds, so a failed step is retried on the next run.
+Each season runs three steps, in this order (game types need the standings' W+L):
+
+    players -> standings -> schedule
+
+A step is recorded in the etl_checkpoint table only after it succeeds, so an interrupted
+or failed run simply resumes where it stopped on the next run.
 
 Usage:
-    python -m etl.pipeline                    # everything not yet done
-    python -m etl.pipeline --season 2024      # one season
+    python -m etl.pipeline                         # every (season, step) not done yet
+    python -m etl.pipeline --season 2026           # one season
     python -m etl.pipeline --start 2000 --end 2010
-    python -m etl.pipeline --season 2024 --force     # re-parse from the HTML cache
-    python -m etl.pipeline --season 2024 --refresh   # re-download pages too
+    python -m etl.pipeline --steps schedule        # only some steps
+    python -m etl.pipeline --force                 # redo everything from the HTML cache
+    python -m etl.pipeline --refresh               # redo everything, re-downloading pages
 """
 import argparse
 import sys
@@ -25,60 +30,59 @@ def last_completed_season(today: date | None = None) -> int:
 
 
 SEASONS = list(range(1980, last_completed_season() + 1))
-# standings must precede schedule: game-type classification needs each team's W+L
-STEPS = ["per_game", "advanced", "standings", "schedule"]
+
+STEPS = {  # step name -> (download + parse, load); dict order is the run order
+    "players": (scraper.get_players, loader.load_players),
+    "standings": (scraper.get_standings, loader.load_standings),
+    "schedule": (scraper.get_schedule, loader.load_games),
+}
 
 
 def run_step(season: int, step: str, refresh: bool) -> int:
-    if step == "per_game":
-        return loader.upsert_player_seasons(scraper.get_player_per_game(season, refresh), season, step)
-    if step == "advanced":
-        return loader.upsert_player_seasons(scraper.get_player_advanced(season, refresh), season, step)
-    if step == "standings":
-        return loader.upsert_standings(scraper.get_standings(season, refresh), season)
-    if step == "schedule":
-        return loader.upsert_games(scraper.get_season_schedule(season, refresh), season)
-    raise ValueError(step)
+    extract, load = STEPS[step]
+    return load(extract(season, refresh), season)
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--season", type=int)
-    ap.add_argument("--start", type=int, default=SEASONS[0])
-    ap.add_argument("--end", type=int, default=SEASONS[-1])
-    ap.add_argument("--steps", nargs="+", choices=STEPS, default=STEPS)
-    ap.add_argument("--force", action="store_true", help="ignore checkpoint (uses HTML cache)")
-    ap.add_argument("--refresh", action="store_true", help="re-download pages (implies --force)")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(description="Scrape NBA seasons into PostgreSQL.")
+    parser.add_argument("--season", type=int, help="one season (ending year, e.g. 2026)")
+    parser.add_argument("--start", type=int, default=SEASONS[0])
+    parser.add_argument("--end", type=int, default=SEASONS[-1])
+    parser.add_argument("--steps", nargs="+", choices=list(STEPS), default=list(STEPS))
+    parser.add_argument("--force", action="store_true", help="ignore the checkpoint (uses the HTML cache)")
+    parser.add_argument("--refresh", action="store_true", help="re-download pages (implies --force)")
+    args = parser.parse_args()
 
-    seasons = [args.season] if args.season else [s for s in SEASONS if args.start <= s <= args.end]
+    seasons = [args.season] if args.season else list(range(args.start, args.end + 1))
+    steps = [s for s in STEPS if s in args.steps]  # keep the dependency order
     done = set() if (args.force or args.refresh) else loader.completed_steps()
     failures = []
 
     for season in seasons:
-        todo = [s for s in args.steps if (season, s) not in done]
+        todo = [step for step in steps if (season, step) not in done]
         if not todo:
             continue
         print(f"── {season - 1}-{str(season)[2:]} ({season})", flush=True)
         for step in todo:
             try:
-                n = run_step(season, step, args.refresh)
-                loader.mark_done(season, step, n)
-                print(f"   ✓ {step:<9} {n:>6} rows", flush=True)
-            except scraper.RateLimited as e:
-                print(f"   ✗ {e}", flush=True)
-                return 2
-            except Exception as e:  # keep going; the step stays un-checkpointed
-                failures.append((season, step, repr(e)))
-                print(f"   ✗ {step:<9} {e!r}", flush=True)
+                rows = run_step(season, step, args.refresh)
+            except scraper.RateLimited as error:
+                print(f"   ✗ {error}", flush=True)
+                return 2  # stop everything: continuing would extend the ban
+            except Exception as error:  # record it, keep going with the next step
+                failures.append((season, step, repr(error)))
+                print(f"   ✗ {step:<9} {error!r}", flush=True)
                 traceback.print_exc(limit=2, file=sys.stderr)
+                continue
+            loader.mark_done(season, step, rows)
+            print(f"   ✓ {step:<9} {rows:>6} rows", flush=True)
 
     if failures:
-        print(f"\n{len(failures)} step(s) failed; re-run to retry:")
-        for f in failures:
-            print("  ", *f)
+        print(f"\n{len(failures)} step(s) failed; run again to retry them:")
+        for failure in failures:
+            print("  ", *failure)
         return 1
-    print("\nETL complete. Run `python -m etl.validate` next.")
+    print("\nETL complete. Next: python -m etl.validate")
     return 0
 
 

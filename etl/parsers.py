@@ -1,280 +1,235 @@
-"""Pure HTML -> DataFrame parsers for Basketball-Reference pages (no network).
+"""Turn Basketball-Reference HTML into DataFrames. Pure functions: no network, no database.
 
-Cells are read by their `data-stat` attribute rather than header text: BRef renames
-visible headers (e.g. "Tm" -> "Team") more often than it renames data-stat keys, and
-reading by key makes visitor/home columns unambiguous (bug §7.1 in the blueprint).
+Every BRef table cell has a stable `data-stat` attribute, e.g.
+
+    <td data-stat="visitor_pts">107</td> ... <td data-stat="home_pts">119</td>
+
+We read cells by that key, never by column position or header text. Headers get renamed
+("Tm" became "Team"), and position-based reading is how v1 swapped home and away scores.
 """
 import re
 import unicodedata
 from datetime import date
 
 import pandas as pd
-from bs4 import BeautifulSoup, Comment, Tag
-
-COMBINED_TEAM_RE = re.compile(r"^(TOT|\dTM)$")
-TEAM_HREF_RE = re.compile(r"/teams/([A-Z0-9]{3})/")
-MONTH_HREF_RE = re.compile(r"/leagues/NBA_(\d{4})_games-([a-z0-9-]+)\.html")
+from bs4 import BeautifulSoup, Tag
 
 
 class TableNotFound(ValueError):
     pass
 
 
-# ---------------------------------------------------------------- generic helpers
+# ---------------------------------------------------------------- helpers
 
 def find_table(html: str, table_id: str) -> Tag:
-    """Find a table by id, including tables BRef hides inside HTML comments."""
-    soup = BeautifulSoup(html, "lxml")
-    table = soup.find("table", id=table_id)
-    if table is not None:
-        return table
-    for comment in soup.find_all(string=lambda s: isinstance(s, Comment) and table_id in s):
-        table = BeautifulSoup(comment, "lxml").find("table", id=table_id)
-        if table is not None:
-            return table
-    raise TableNotFound(f"table id={table_id!r} not found")
+    table = BeautifulSoup(html, "lxml").find("table", id=table_id)
+    if table is None:
+        raise TableNotFound(f"table id={table_id!r} not found")
+    return table
 
 
-def table_ids(html: str) -> list[str]:
-    return re.findall(r'<table[^>]*\bid="([^"]+)"', html)
-
-
-def _cell_record(tr: Tag) -> dict:
-    """Map data-stat -> text, plus '<stat>@href', '<stat>@csk' and '<stat>@id' extras."""
-    rec = {}
+def read_row(tr: Tag) -> dict[str, str]:
+    """{data-stat: text} for one table row, plus three extras we need:
+    '<stat>@href' (link target), '<stat>@csk' (sort key) and '<stat>@id' (player id)."""
+    row = {}
     for cell in tr.find_all(["th", "td"]):
         stat = cell.get("data-stat")
         if not stat:
             continue
-        rec[stat] = cell.get_text(strip=True)
-        if cell.a and cell.a.get("href"):
-            rec[f"{stat}@href"] = cell.a["href"]
-        if cell.get("csk"):
-            rec[f"{stat}@csk"] = cell["csk"]
-        if cell.get("data-append-csv"):
-            rec[f"{stat}@id"] = cell["data-append-csv"]
-    return rec
+        row[stat] = cell.get_text(strip=True)
+        if cell.a:
+            row[f"{stat}@href"] = cell.a["href"]
+        if cell.has_attr("csk"):
+            row[f"{stat}@csk"] = cell["csk"]
+        if cell.has_attr("data-append-csv"):
+            row[f"{stat}@id"] = cell["data-append-csv"]
+    return row
 
 
-def _body_rows(table: Tag) -> list[Tag]:
-    body = table.tbody or table
-    return [tr for tr in body.find_all("tr") if "thead" not in (tr.get("class") or [])]
-
-
-def _first(rec: dict, *keys: str, default=None):
-    for k in keys:
-        if rec.get(k) not in (None, ""):
-            return rec[k]
-    return default
-
-
-def _num(value) -> float | None:
-    if value in (None, "", "—", "-"):
-        return None
+def to_float(text: str | None) -> float | None:
+    """'1,234' -> 1234.0; '' or '—' -> None."""
     try:
-        return float(str(value).replace(",", ""))
-    except ValueError:
+        return float(text.replace(",", ""))
+    except (AttributeError, ValueError):
         return None
 
 
-def _team_from_href(href: str | None) -> str | None:
-    m = TEAM_HREF_RE.search(href or "")
-    return m.group(1) if m else None
+def team_from_link(href: str | None) -> str | None:
+    """'/teams/OKC/2025.html' -> 'OKC'."""
+    match = re.search(r"/teams/([A-Z0-9]{3})/", href or "")
+    return match.group(1) if match else None
 
 
 def clean_name(name: str) -> str:
+    """Drop the Hall-of-Fame marker: 'Michael Jordan*' -> 'Michael Jordan'."""
     return name.replace("*", "").strip()
 
 
 def search_name(name: str) -> str:
+    """Lower-case, accent-free form for lookups: 'Nikola Jokić' -> 'nikola jokic'."""
     ascii_name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
-    return re.sub(r"\s+", " ", ascii_name).strip().lower()
+    return " ".join(ascii_name.split()).lower()
 
 
 # ---------------------------------------------------------------- player tables
 
-# data-stat key(s) -> our column.  Alternatives cover older BRef layouts.
-PER_GAME_MAP = {
-    "g": ("games", "g"), "gs": ("games_started", "gs"), "mp": ("mp_per_g",),
-    "fg": ("fg_per_g",), "fga": ("fga_per_g",), "fg_pct": ("fg_pct",),
-    "fg3": ("fg3_per_g",), "fg3a": ("fg3a_per_g",), "fg3_pct": ("fg3_pct",),
-    "ft": ("ft_per_g",), "fta": ("fta_per_g",), "ft_pct": ("ft_pct",), "efg_pct": ("efg_pct",),
-    "orb": ("orb_per_g",), "drb": ("drb_per_g",), "reb": ("trb_per_g",),
-    "ast": ("ast_per_g",), "stl": ("stl_per_g",), "blk": ("blk_per_g",),
-    "tov": ("tov_per_g",), "pf": ("pf_per_g",), "pts": ("pts_per_g",),
+# our column -> BRef data-stat, per page
+PER_GAME_STATS = {
+    "g": "games", "gs": "games_started", "mp": "mp_per_g",
+    "fg": "fg_per_g", "fga": "fga_per_g", "fg_pct": "fg_pct",
+    "fg3": "fg3_per_g", "fg3a": "fg3a_per_g", "fg3_pct": "fg3_pct",
+    "ft": "ft_per_g", "fta": "fta_per_g", "ft_pct": "ft_pct", "efg_pct": "efg_pct",
+    "orb": "orb_per_g", "drb": "drb_per_g", "reb": "trb_per_g",
+    "ast": "ast_per_g", "stl": "stl_per_g", "blk": "blk_per_g",
+    "tov": "tov_per_g", "pf": "pf_per_g", "pts": "pts_per_g",
 }
-ADVANCED_MAP = {
-    "mp_total": ("mp",), "per": ("per",), "ts_pct": ("ts_pct",),
-    "fg3a_rate": ("fg3a_per_fga_pct",), "fta_rate": ("fta_per_fga_pct",),
-    "orb_pct": ("orb_pct",), "drb_pct": ("drb_pct",), "trb_pct": ("trb_pct",),
-    "ast_pct": ("ast_pct",), "stl_pct": ("stl_pct",), "blk_pct": ("blk_pct",),
-    "tov_pct": ("tov_pct",), "usg_pct": ("usg_pct",), "ows": ("ows",), "dws": ("dws",),
-    "ws": ("ws",), "ws_per_48": ("ws_per_48",), "obpm": ("obpm",), "dbpm": ("dbpm",),
-    "bpm": ("bpm",), "vorp": ("vorp",),
+ADVANCED_STATS = {
+    "mp_total": "mp", "per": "per", "ts_pct": "ts_pct",
+    "fg3a_rate": "fg3a_per_fga_pct", "fta_rate": "fta_per_fga_pct",
+    "orb_pct": "orb_pct", "drb_pct": "drb_pct", "trb_pct": "trb_pct",
+    "ast_pct": "ast_pct", "stl_pct": "stl_pct", "blk_pct": "blk_pct",
+    "tov_pct": "tov_pct", "usg_pct": "usg_pct", "ows": "ows", "dws": "dws",
+    "ws": "ws", "ws_per_48": "ws_per_48", "obpm": "obpm", "dbpm": "dbpm",
+    "bpm": "bpm", "vorp": "vorp",
 }
-PLAYER_TABLE_IDS = {
-    "per_game": ("per_game_stats",),
-    "advanced": ("advanced", "advanced_stats"),
+PLAYER_PAGES = {  # kind -> (table id, stat map)
+    "per_game": ("per_game_stats", PER_GAME_STATS),
+    "advanced": ("advanced", ADVANCED_STATS),
 }
 
 
 def parse_player_table(html: str, kind: str) -> pd.DataFrame:
-    """Parse a league per_game or advanced page into one row per (player, team).
+    """One row per (player, team) from a league per_game or advanced page.
 
-    Columns: bref_id, name, age, team_abr ('TOT' for combined rows), pos, team_list,
-    is_primary, plus the stat columns of `kind`.
+    A traded player appears once per team plus once combined. BRef labels the combined
+    row 'TOT' (older pages) or '2TM'/'3TM' (current pages); we always call it 'TOT'.
+    Adds `is_primary` (the TOT row if any, otherwise the only row) and `team_list`.
     """
-    stat_map = PER_GAME_MAP if kind == "per_game" else ADVANCED_MAP
-    table = None
-    for tid in PLAYER_TABLE_IDS[kind]:
-        try:
-            table = find_table(html, tid)
-            break
-        except TableNotFound:
-            continue
-    if table is None:
-        raise TableNotFound(f"no {kind} table (tried {PLAYER_TABLE_IDS[kind]})")
-
+    table_id, stats = PLAYER_PAGES[kind]
     rows = []
-    for tr in _body_rows(table):
-        rec = _cell_record(tr)
-        bref_id = _first(rec, "name_display@id", "player@id")
-        if not bref_id:
-            continue  # league-average / separator rows
-        team = _first(rec, "team_name_abbr", "team_id", default="UNK")
-        row = {
-            "bref_id": bref_id,
-            "name": clean_name(_first(rec, "name_display", "player", default="")),
-            "age": _num(rec.get("age")),
-            "team_abr": "TOT" if COMBINED_TEAM_RE.match(team) else team,
-            "pos": rec.get("pos") or None,
-        }
-        for col, keys in stat_map.items():
-            row[col] = _num(_first(rec, *keys))
-        rows.append(row)
-
+    for tr in find_table(html, table_id).tbody.find_all("tr"):
+        cell = read_row(tr)
+        if "name_display@id" not in cell:
+            continue  # the "League Average" row has no player id
+        team = cell["team_name_abbr"]
+        rows.append({
+            "bref_id": cell["name_display@id"],
+            "name": clean_name(cell["name_display"]),
+            "age": to_float(cell.get("age")),
+            "team_abr": "TOT" if re.fullmatch(r"TOT|\dTM", team) else team,
+            "pos": cell.get("pos") or None,
+            **{col: to_float(cell.get(key)) for col, key in stats.items()},
+        })
     df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-    # One primary row per player-season: the TOT row for traded players, else the only row.
-    has_tot = df.groupby("bref_id")["team_abr"].transform(lambda s: (s == "TOT").any())
-    df["is_primary"] = (df["team_abr"] == "TOT") | ~has_tot
-    teams = (df[df["team_abr"] != "TOT"].groupby("bref_id", sort=False)["team_abr"]
-             .agg(",".join))
-    df["team_list"] = df["bref_id"].map(teams).where(df["team_abr"] == "TOT", df["team_abr"])
-    return df.drop_duplicates(["bref_id", "team_abr"]).reset_index(drop=True)
+
+    traded = set(df.loc[df["team_abr"] == "TOT", "bref_id"])
+    df["is_primary"] = (df["team_abr"] == "TOT") | ~df["bref_id"].isin(traded)
+    teams_of = df[df["team_abr"] != "TOT"].groupby("bref_id", sort=False)["team_abr"].agg(",".join)
+    df["team_list"] = df["team_abr"].where(df["team_abr"] != "TOT", df["bref_id"].map(teams_of))
+    return df
+
+
+def merge_player_tables(per_game: pd.DataFrame, advanced: pd.DataFrame) -> pd.DataFrame:
+    """Join the two player pages into one wide row per (player, team).
+
+    Both pages list exactly the same rows (checked on every season since 1980). The outer
+    join with validate="one_to_one" still guarantees nothing is silently dropped or doubled.
+    """
+    advanced_stats = advanced[["bref_id", "team_abr", *ADVANCED_STATS]]
+    return per_game.merge(advanced_stats, on=["bref_id", "team_abr"], how="outer",
+                          validate="one_to_one")
 
 
 # ---------------------------------------------------------------- standings
 
 def parse_standings(html: str) -> pd.DataFrame:
-    """Parse both conferences.  Uses division tables (present in every era) and falls back
-    to conference tables; each table is normalised on its own before concatenation (§7.3)."""
-    frames = []
-    for conf in ("E", "W"):
-        table = tid = None
-        for cand in (f"divs_standings_{conf}", f"confs_standings_{conf}"):
-            try:
-                table, tid = find_table(html, cand), cand
-                break
-            except TableNotFound:
-                continue
-        if table is None:
-            raise TableNotFound(f"no standings table for conference {conf}")
+    """Both conferences' final standings, one row per team.
+
+    The division tables (divs_standings_E/W) exist in every season since 1980. Each
+    conference is parsed on its own; v1 merged the two tables first and lost the West.
+    Inside a table, rows with class "thead" are division headers ("Atlantic Division").
+    """
+    rows = []
+    for conference in ("E", "W"):
         division = None
-        rows = []
-        body = table.tbody or table
-        for tr in body.find_all("tr"):
-            if "thead" in (tr.get("class") or []):
-                division = tr.get_text(strip=True).replace(" Division", "") or division
+        for tr in find_table(html, f"divs_standings_{conference}").tbody.find_all("tr"):
+            if "thead" in tr.get("class", []):
+                division = tr.get_text(strip=True).removesuffix(" Division")
                 continue
-            rec = _cell_record(tr)
-            team_abr = _team_from_href(rec.get("team_name@href"))
-            if not team_abr:
-                continue
+            cell = read_row(tr)
             rows.append({
-                "team_abr": team_abr,
-                "full_name": clean_name(rec.get("team_name", "")),
-                "made_playoffs": "*" in rec.get("team_name", ""),
-                "conference": conf,
-                "division": division if tid.startswith("divs") else None,
-                "w": _num(rec.get("wins")), "l": _num(rec.get("losses")),
-                "w_pct": _num(rec.get("win_loss_pct")),
-                "gb": _num(rec.get("gb")) or 0.0,
-                "ps_g": _num(rec.get("pts_per_g")), "pa_g": _num(rec.get("opp_pts_per_g")),
-                "srs": _num(rec.get("srs")),
+                "team_abr": team_from_link(cell["team_name@href"]),
+                "full_name": clean_name(cell["team_name"]),
+                "made_playoffs": cell["team_name"].endswith("*"),
+                "conference": conference,
+                "division": division,
+                "w": int(cell["wins"]),
+                "l": int(cell["losses"]),
+                "w_pct": to_float(cell["win_loss_pct"]),
+                "gb": to_float(cell["gb"]) or 0.0,  # the leader shows '—'
+                "ps_g": to_float(cell["pts_per_g"]),
+                "pa_g": to_float(cell["opp_pts_per_g"]),
+                "srs": to_float(cell["srs"]),
             })
-        frames.append(pd.DataFrame(rows))
-    df = pd.concat(frames, ignore_index=True)
-    for c in ("w", "l"):
-        df[c] = df[c].astype("Int64")
-    return df
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------- schedule
 
 def parse_schedule_months(html: str, season: int) -> list[str]:
-    """Month slugs linked from NBA_{season}_games.html (e.g. 'october-2019', 'july')."""
-    slugs = []
-    for y, slug in MONTH_HREF_RE.findall(html):
-        if int(y) == season and slug not in slugs:
-            slugs.append(slug)
-    return slugs
+    """Month page slugs linked from NBA_{season}_games.html, in order.
+
+    Discovered rather than hard-coded because seasons vary: lockouts skip months, and the
+    2020 bubble ran 'october-2019' ... 'july', 'august', 'september', 'october-2020'.
+    """
+    slugs = re.findall(rf"/leagues/NBA_{season}_games-([a-z0-9-]+)\.html", html)
+    return list(dict.fromkeys(slugs))  # de-duplicate, keep order
 
 
 def parse_schedule(html: str, season: int) -> pd.DataFrame:
-    """One row per *played* game.  BRef columns are visitor first, then home (§7.1)."""
-    table = find_table(html, "schedule")
+    """One row per played game on a schedule page (columns: visitor first, then home)."""
     rows = []
-    for tr in _body_rows(table):
-        rec = _cell_record(tr)
-        away_score, home_score = _num(rec.get("visitor_pts")), _num(rec.get("home_pts"))
-        if away_score is None or home_score is None:
-            continue  # unplayed / postponed
-        away = _team_from_href(rec.get("visitor_team_name@href"))
-        home = _team_from_href(rec.get("home_team_name@href"))
-        game_id = rec.get("date_game@csk") or ""
-        box = rec.get("box_score_text@href", "")
-        if not re.fullmatch(r"\d{9}[A-Z]{3}", game_id):
-            m = re.search(r"/boxscores/(\w+)\.html", box)
-            game_id = m.group(1) if m else f"{season}_{rec.get('date_game')}_{away}_{home}"
-        game_date = _parse_date(game_id, rec.get("date_game", ""))
+    for tr in find_table(html, "schedule").tbody.find_all("tr"):
+        cell = read_row(tr)
+        if not cell.get("home_pts"):
+            continue  # scheduled but not played yet
+        game_id = cell["date_game@csk"]  # e.g. "202310240DEN": date + "0" + home team
+        game_date = date(int(game_id[:4]), int(game_id[4:6]), int(game_id[6:8]))
+        away_score, home_score = int(cell["visitor_pts"]), int(cell["home_pts"])
+        attendance = to_float(cell.get("attendance"))
         rows.append({
             "game_id": game_id,
             "season": season,
             "game_date": game_date,
-            "away_team": away, "home_team": home,
-            "away_name": rec.get("visitor_team_name"), "home_name": rec.get("home_team_name"),
-            "away_score": int(away_score), "home_score": int(home_score),
+            "away_team": team_from_link(cell["visitor_team_name@href"]),
+            "home_team": team_from_link(cell["home_team_name@href"]),
+            "away_name": cell["visitor_team_name"],
+            "home_name": cell["home_team_name"],
+            "away_score": away_score,
+            "home_score": home_score,
             "home_win": home_score > away_score,
-            "overtimes": rec.get("overtimes") or None,
-            "attendance": int(_num(rec.get("attendance"))) if _num(rec.get("attendance")) else None,
-            "remarks": rec.get("game_remarks") or None,
-            "neutral": is_neutral_site(rec.get("game_remarks"), season, game_date),
+            "overtimes": cell.get("overtimes") or None,
+            "attendance": int(attendance) if attendance else None,
+            "remarks": cell.get("game_remarks") or None,
+            "neutral": is_neutral_site(cell.get("game_remarks"), season, game_date),
         })
     return pd.DataFrame(rows)
 
 
-BUBBLE_START = date(2020, 7, 30)        # 2020 restart in Orlando: no home crowds
-VENUE_RE = re.compile(r"^at [^,]+, ([^(]+)")
+BUBBLE_START = date(2020, 7, 30)  # the 2020 restart in Orlando: no home crowds
 
 
 def is_neutral_site(remarks: str | None, season: int, game_date: date) -> bool:
-    """True for games abroad (London, Mexico City, Tokyo, Paris, ...) and the 2020 bubble.
+    """True for games abroad ("at London, England", "at Mexico City, Mexico") and the bubble.
 
-    Domestic alternate venues ("at Hartford, CT" for the Celtics) and Canadian ones (Raptors
-    and Grizzlies home alternates) keep a real home edge in the data, so they stay home games.
+    Domestic alternate venues ("at Hartford, CT", a Celtics second home) and Canadian ones
+    (Raptors/Grizzlies alternates) keep a real home edge in the data, so they stay home games.
     """
     if season == 2020 and game_date >= BUBBLE_START:
         return True
-    m = VENUE_RE.match(remarks or "")
-    if not m:
+    match = re.match(r"at [^,]+, ([^(]+)", remarks or "")
+    if not match:
         return False
-    place = m.group(1).strip()
-    return not re.fullmatch(r"[A-Z]{2}", place) and place != "Canada"
-
-
-def _parse_date(game_id: str, text: str) -> date:
-    if re.match(r"\d{8}", game_id):
-        return date(int(game_id[:4]), int(game_id[4:6]), int(game_id[6:8]))
-    return pd.to_datetime(text, format="%a, %b %d, %Y").date()
+    place = match.group(1).strip()          # "England", "CT", "Canada"
+    is_us_state = re.fullmatch(r"[A-Z]{2}", place) is not None
+    return not is_us_state and place != "Canada"

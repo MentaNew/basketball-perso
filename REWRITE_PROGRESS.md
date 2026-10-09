@@ -26,8 +26,8 @@ Status log for the two-axis plan agreed on 2026-10-05. **Read this first when co
   - `nba_platform` is the old v1 data. Don't use it.
 - **`.env`:** `DATABASE_URL` now points at `nba_platform_l0` (switched at module 5). The
   reference URL is kept as a comment line above it.
-- **Models (`models/*.pkl`)** were trained on `nba_platform_v2` data by the old code. That's
-  fine until modules 7–10 retrain them.
+- **Models:** `game_predictor.pkl` was retrained by the new code (module 8). The similarity
+  and LSTM artifacts still come from the old code until modules 9–10 retrain them.
 
 ### L0 module checklist
 
@@ -35,14 +35,14 @@ Status log for the two-axis plan agreed on 2026-10-05. **Read this first when co
 |---|---|---|
 | 0 | Setup: commit, tag `v0-reference`, branch, create `nba_platform_l0` | ✅ done |
 | 1 | `db/models.py`, `db/init_db.py` | ✅ committed (`9fc346f`) |
-| 2 | `etl/parsers.py` (280 → 235 lines) | ✅ verified, **⚠️ NOT COMMITTED YET** |
-| 3 | `etl/scraper.py` (merged `get_players`) | ✅ verified, **⚠️ NOT COMMITTED YET** |
-| 4 | `etl/loader.py` (replace-season pattern; column lists removed from models) | ✅ verified, **⚠️ NOT COMMITTED YET** |
-| 5 | `etl/pipeline.py` (3 steps) + first full load into `nba_platform_l0` | ✅ verified, **⚠️ NOT COMMITTED YET** |
-| 6 | `etl/validate.py` (declarative `CHECKS = {name: SQL returning bad rows}`) | ⏭ **next** |
-| 7 | `ml/features.py` (tidy; guarantee the `neutral` column) | ⏳ |
-| 8 | `ml/game_predictor.py` (ship raw XGBoost, drop calibration) | ⏳ |
-| 9 | `ml/similarity.py` (light tidy) | ⏳ |
+| 2 | `etl/parsers.py` (280 → 235 lines) | ✅ committed (`cb3f819`) |
+| 3 | `etl/scraper.py` (merged `get_players`) | ✅ committed (`cbd84ef`) |
+| 4 | `etl/loader.py` (replace-season pattern; column lists removed from models) | ✅ committed (`cbd84ef`) |
+| 5 | `etl/pipeline.py` (3 steps) + first full load into `nba_platform_l0` | ✅ committed (`cbd84ef`) |
+| 6 | `etl/validate.py` (declarative SQL checks) + `tests/test_validate.py` (mutation tests) | ✅ verified, **⚠️ NOT COMMITTED YET** |
+| 7 | `ml/features.py` (tidy; `read_*` renames; guaranteed `neutral` column) | ✅ verified, **⚠️ NOT COMMITTED YET** |
+| 8 | `ml/game_predictor.py` (ship raw XGBoost, drop calibration) | ✅ verified + retrained, **⚠️ NOT COMMITTED YET** |
+| 9 | `ml/similarity.py` (light tidy) | ⏭ **next** |
 | 10 | `ml/player_lstm.py` (keep LSTM, light tidy) | ⏳ |
 | 11 | `app/` (adapt to API changes) | ⏳ |
 | 12 | Tests + docs: update `PHASE1–5` guides, write `ENGINEERING_LEVELS.md` | ⏳ |
@@ -116,13 +116,55 @@ Status log for the two-axis plan agreed on 2026-10-05. **Read this first when co
 4. The parser rewrite was verified by comparing against the old parser rather than only by
    unit tests. What does that "differential testing" catch that the fixture tests can't?
 
+### Modules 6–8 — what was done (2026-10-09)
+
+**Module 6, `etl/validate.py`** (168 → 146 lines).
+- `CHECKS = {rule: SQL returning the rows that break it}`; a check passes when its query
+  returns nothing, and a failure prints the offending rows.
+- `run_checks(conn, seasons)` takes a connection, so it can run inside a transaction.
+- "Every player has a bref_id" is dropped, because the schema's `NOT NULL` already
+  guarantees it. Let constraints enforce what a check would only observe.
+- **Mutation tests** (`tests/test_validate.py`) re-inject past bugs inside always-rolled-back
+  transactions and assert the right check fails: swapped scores (v1 §7.1), missing West
+  (§7.3), `UNK` teams (§7.4), an unfinished step, a Cup final counted as regular, and a
+  missing relocation. All are caught. The tests skip if `DATABASE_URL` isn't fully loaded.
+
+**Module 7, `ml/features.py`.**
+- `load_games`/`load_player_seasons` renamed to `read_games`/`read_player_seasons`, because
+  `etl.loader.load_games` *writes* games. "load" now means one thing project-wide.
+- Removed the unused `load_team_seasons` and the `primary_only` option. The `getattr`
+  neutral hack is gone (the column is guaranteed). Constants documented, 4 clear sections.
+- **Verified:** old vs new outputs identical on the full DB: 56,451 game feature rows,
+  1,314 snapshots, 14,346 similarity rows, 7,709 LSTM windows.
+
+**Module 8, `ml/game_predictor.py`.**
+- Ships **raw XGBoost**; `CalibratedClassifierCV` is removed. `functools.cache` replaces the
+  global-variable bundle cache.
+- **Verified:** retrained held-out (2025–26) 0.6702 accuracy / 0.6099 log-loss / 0.7295 AUC,
+  exactly the old run's raw-XGB row. Elo-only 0.6607 / 0.6192.
+- ⚠️ **Behaviour change found:** without calibration's flattening, the model over-reacts to
+  `is_neutral`. OKC vs BOS goes from 62% (home) to 50% (neutral), which is implausible. The
+  207 neutral training games are mostly coin-flip bubble games. Tracked in NEXT_STEPS #2
+  (an L3 model fix).
+
+**Self-check questions:**
+1. Why is a query that returns *violating rows* a better check shape than one returning a
+   boolean?
+2. The swapped-scores mutation didn't trip the *overall* home-win check, but three other
+   checks caught it. What does that teach about designing a validation suite?
+3. Why does the mutation test use `transaction.rollback()` in a `finally` block rather than
+   after the assertions?
+4. Calibration was removed because it hurt the held-out metrics, and that revealed the
+   neutral-site over-reaction. What's the lesson about evaluating a model only on aggregate
+   metrics?
+
 **Not committed yet.** Suggested commits:
 ```bash
-git add etl/parsers.py && git commit -m "L0 module 2: evidence-driven parser simplification (parity on 588 pages)"
-git add -A etl db tests REWRITE_PROGRESS.md && git commit -m "L0 modules 3-5: merged players step, replace-season loader, 3-step pipeline"
+git add etl/validate.py tests/test_validate.py && git commit -m "L0 module 6: declarative SQL validation checks + mutation tests"
+git add ml/features.py tests/test_features.py && git commit -m "L0 module 7: tidy shared features, read_* naming (parity on full data)"
+git add ml/game_predictor.py && git commit -m "L0 module 8: ship raw XGBoost, drop calibration (held-out identical)"
+git add REWRITE_PROGRESS.md NEXT_STEPS.md ML_NEXT_STEPS.md .gitignore && git commit -m "Update rewrite progress; add ML work plan"
 ```
-`.claude/settings.json` (enables a Claude Code plugin) is untracked. Commit it if you want the
-plugin setting shared, or add `.claude/` to `.gitignore`.
 
 ---
 
@@ -130,14 +172,16 @@ plugin setting shared, or add `.claude/` to `.gitignore`.
 
 ```bash
 cd ~/Projects/personal_projects/basketball
-git switch rewrite/minimal && git status          # modules 2-5 may still be uncommitted (see above)
+git switch rewrite/minimal && git status          # modules 6-8 may still be uncommitted (see above)
 
 conda activate nba                                # or /opt/miniconda3/envs/nba/bin/python
 export PYTHONPATH=.
-pytest -q && ruff check .                         # expect 46 passed, all checks passed
+pytest -q && ruff check .                         # expect 53 passed, all checks passed
 ```
 
-Then ask Claude: **"continue the rewrite with module 6 (etl/validate.py)"**.
+Then either ask Claude: **"continue the rewrite with module 9 (ml/similarity.py)"**, or work on
+the ML problems yourself. **`ML_NEXT_STEPS.md`** is your work plan: neutral sites,
+calibration, LSTM vs Ridge, predictor features, number of archetypes, and an experiment log.
 
 ---
 

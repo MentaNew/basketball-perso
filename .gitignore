@@ -13,6 +13,7 @@ venv/
 # Tooling caches & reports
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
 .coverage
 htmlcov/
 .ipynb_checkpoints/
@@ -23,16 +24,24 @@ data/
 # Model artifacts (re-creatable with `python -m ml.<model> train`)
 models/*
 !models/.gitkeep
+
+# ML experiments: tracking runs, checkpoints, scratch outputs (keep code + notebooks, not results)
 mlruns/
+wandb/
+lightning_logs/
+*.ckpt
+experiments/outputs/
+scratch/
 
 # Logs
 logs/
 *.log
 
-# Editors / OS
+# Editors / OS / local assistant settings
 .vscode/
 .idea/
 .DS_Store
+.claude/
 
 # Leftover from the v1 pipeline
 .etl_checkpoint.json

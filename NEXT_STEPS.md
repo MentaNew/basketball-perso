@@ -33,15 +33,9 @@ what "done" means. Phase guides: `PHASE1_ETL_GUIDE.md` … `PHASE5_STREAMLIT_APP
 
 ## P0 — Findings from the latest retrain
 
-### 1. Ship the raw or the calibrated game model?
-On the new holdout (2024-25 and 2025-26), isotonic calibration made things slightly
-**worse**: log-loss 0.614 vs 0.610 raw, accuracy 0.664 vs 0.670. Each `TimeSeriesSplit`
-calibration fold trains its XGBoost on less and older data.
-- **Do:** in `ml/game_predictor.py`, choose between raw, isotonic and sigmoid by log-loss on
-  the **last training season** (never the test seasons). Alternatively, calibrate a model fit
-  on all training data using a held-out final training season (`cv="prefit"`-style).
-- **Done when:** the shipped model is the best of the three on validation, and the choice is
-  stored in the bundle and shown in the app's "How good is the model?" expander.
+### 1. ~~Ship the raw or the calibrated game model?~~ (resolved 2026-10-09)
+The L0 rewrite ships raw XGBoost (held-out 0.670 accuracy / 0.610 log-loss vs 0.664 / 0.614
+calibrated). Calibration gets revisited properly in L3.
 
 ### 2. Make the predictor respect neutral sites
 Only 207 of ~56k games are neutral, so XGBoost barely splits on `is_neutral`. OKC–BOS moves
@@ -51,7 +45,13 @@ properly.
   then shift by the learned home-court effect in logit space when neutral, or (c) train on
   the symmetric augmentation (each game also seen with teams swapped and `is_home` = ±1, so
   home court becomes a single explicit feature).
-- **Done when:** a neutral-site prediction for two teams with equal snapshots is ≈ 0.50.
+- **Update 2026-10-09:** with calibration removed, the model now **over**-reacts instead.
+  OKC (68-14) vs BOS goes from 0.62 at home to 0.50 at a neutral site, because the 207
+  neutral training games are mostly near coin-flip bubble games. Option (c) addresses
+  both directions.
+- **Done when:** a neutral-site prediction for two teams with equal snapshots is ≈ 0.50, and
+  the gap between home and neutral for the same matchup is close to Elo's home-court
+  effect (a few percentage points, not 12).
 
 ---
 

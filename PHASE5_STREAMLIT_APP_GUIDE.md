@@ -25,7 +25,8 @@ Files: `app/Home.py`, `app/utils.py`, `app/pages/*.py`, `run.sh`.
 Two rules keep the pages thin:
 1. **Pages never write SQL.** Every query lives in `app/utils.py` as a `cached_*` function.
 2. **Pages never touch model internals.** They call the public functions from Phases 2–4.
-   Each model module loads its bundle lazily, once per process (`_load()`).
+   Each model module loads its bundle lazily, once per process (`load_bundle()`, cached with
+   `functools.cache`).
 
 Launch:
 
@@ -174,7 +175,7 @@ Checklist:
 | Problem | Cause | Fix |
 |---|---|---|
 | `ModuleNotFoundError: app` / `ml` | Launched without `PYTHONPATH=.` | Use `./run.sh` |
-| Page hangs on the LSTM projection after using the predictor | OpenMP clash between xgboost and torch | Keep `torch.set_num_threads(1)` in `player_lstm._load()` |
+| Page hangs on the LSTM projection after using the predictor | OpenMP clash between xgboost and torch | Keep `torch.set_num_threads(1)` in `player_lstm.load_bundle()` |
 | New data or model doesn't show up | `st.cache_data` (1 h) and module-level bundle caches | Restart the server, or use "Clear cache" in the ⋮ menu |
 | First load of Explorer/Profile is slow | Unpickling the similarity bundle | Only the first request in each process pays this |
 

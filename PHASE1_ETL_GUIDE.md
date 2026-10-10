@@ -57,7 +57,7 @@ export PYTHONPATH=.                    # every command runs as `python -m packag
 db/
   models.py       SQLAlchemy tables: the single source of truth for the schema
   connection.py   get_engine() (cached, pool_pre_ping) and query_df(sql, params)
-  init_db.py      create tables + apply MIGRATIONS + (re)create VIEWS (idempotent)
+  init_db.py      init_db(): create tables + (re)create the lookup views (idempotent)
 etl/
   scraper.py      network + HTML cache. The only file that talks to the internet
   parsers.py      pure HTML → DataFrame functions. No network, no DB, fully tested
@@ -100,15 +100,15 @@ Design decisions:
 - **Identity is `bref_id`** (`jamesle01`), taken from the `data-append-csv` attribute of the
   player cell. Names are not unique: two Tony Mitchells both played in 2013-14.
 - **Wide player rows.** v1 stored per-game and advanced data as separate long-format rows
-  that every consumer had to pivot. Now one row holds both: the per-game step writes its
-  columns and the advanced step fills in the rest of the same row.
+  that every consumer had to pivot. Now one row holds both: the `players` step reads both
+  pages and merges them (`parsers.merge_player_tables`) before loading.
 - **Traded players** get one row per team **plus** a combined row with `team_abr = 'TOT'`
   (BRef calls it `2TM`/`3TM`). `is_primary` is true for exactly one row per player-season:
   the TOT row if it exists, otherwise the only row. ML code filters on `is_primary`. Team
   views can use the per-team rows.
-- **Schema changes:** add the column in `models.py` **and** an `ALTER TABLE … ADD COLUMN IF NOT
-  EXISTS` line to `MIGRATIONS` in `init_db.py`, because `create_all` never alters an existing
-  table.
+- **Schema changes:** `create_all` never alters an existing table. Until migrations arrive
+  (Alembic, level L1), changing a column means `python -m db.init_db --drop` and reloading from
+  the HTML cache (`python -m etl.pipeline --force`, ~1.5 min).
 - **Lookups are views, not tables.** `teams` and `franchises` (blueprint §7.5) are derived from
   `team_seasons` by `init_db`, so they can never disagree with it. Example:
   `SELECT * FROM teams WHERE franchise_id = 'OKC'` returns `SEA` (1980–2008) and `OKC` (2009–).
@@ -132,8 +132,8 @@ fetch_page(season, page, refresh=False, sleep_s=4.0) -> str | None
 - **Rate limit.** A `429` raises `RateLimited`, and the pipeline stops immediately instead of
   hammering the server.
 
-Wrappers: `get_player_per_game`, `get_player_advanced`, `get_standings` and
-`get_season_schedule`. The schedule wrapper first reads the season index
+Wrappers: `get_players` (per-game + advanced pages merged into one frame), `get_standings`
+and `get_schedule`. The schedule wrapper first reads the season index
 `NBA_{y}_games.html` and discovers the month pages from its links. Fixed month lists break
 on lockouts and on the 2020 bubble (`october-2019` … `july`, `august`, `september`,
 `october-2020`). The index page already shows the first month, so that month's page is not
@@ -155,27 +155,28 @@ Every BRef cell carries a stable `data-stat` key:
 
 v1 used `pandas.read_html` and mapped the **first** `PTS` column to the home team. That
 column belongs to the visitor, so every result in the database was inverted (§7.1). Reading
-`visitor_pts` and `home_pts` by key makes that mistake impossible. `_cell_record(tr)` turns a
+`visitor_pts` and `home_pts` by key makes that mistake impossible. `read_row(tr)` turns a
 row into `{data-stat: text}` plus three extras: `@href` (link), `@csk` (sort key) and `@id`
 (`data-append-csv`, the player id).
 
-`find_table(html, id)` also searches inside HTML comments, where BRef hides many tables.
+**Evidence-driven simplicity:** fallbacks were measured on all 47 cached seasons before the L0
+rewrite. Those that never fired were removed: the HTML-comment table search, old-layout
+aliases, the conference-table fallback, and backup game-id sources. Resilience against
+future layout changes comes back in L2, as data contracts with tests.
 
 ### 5.2 Player tables: `parse_player_table(html, "per_game" | "advanced")`
 
-- Table ids: `per_game_stats` and `advanced` (it was `advanced_stats` in the past; both are
-  tried).
+- Table ids: `per_game_stats` and `advanced`.
 - Team column: `team_name_abbr` (formerly `Tm`/`team_id`). v1 looked for `Tm` and wrote `UNK`
   for every row (§7.4).
 - `TOT`, `2TM`, `3TM`, … → `TOT`. Then `is_primary` and `team_list` (e.g. `"DAL,LAL"`).
-- `PER_GAME_MAP` and `ADVANCED_MAP` translate data-stat keys to our columns, with fallbacks
-  for older layouts.
+- `PER_GAME_STATS` and `ADVANCED_STATS` map our columns to BRef data-stat keys.
+- Rows without a player id (the 94 "League Average" rows) are skipped.
 
 ### 5.3 Standings: `parse_standings(html)`
 
-- Uses `divs_standings_E/W` (division tables exist in every era) and falls back to
-  `confs_standings_E/W`. v1 only knew the conference tables, which don't exist before ~2016
-  (§7.3).
+- Uses `divs_standings_E/W`, the division tables, which exist in every season since 1980.
+  v1 only knew the conference tables, which don't exist before ~2016 (§7.3).
 - Each conference is parsed **separately** and only then concatenated. v1 concatenated first,
   and the differing header names wiped out every West row.
 - The team abbreviation comes from the link (`/teams/OKC/2025.html`), the division from the
@@ -197,19 +198,19 @@ row into `{data-stat: text}` plus three extras: `@href` (link), `@csk` (sort key
 
 ## Step 6 — Loading (`etl/loader.py`)
 
-Every load is a **refresh of that season**:
-- `INSERT … ON CONFLICT (key) DO UPDATE` writes the new values. v1 used `DO NOTHING`, which
-  silently kept stale or broken rows.
-- Rows of that season that are **no longer in the source** are deleted in the same
-  transaction (a game whose id BRef corrected, a re-attributed trade row). Without this,
-  upserts alone would leave them behind forever.
+Every load **replaces the season**: in one transaction, `DELETE … WHERE season = ?`, then
+insert the fresh rows with `DataFrame.to_sql`.
+- **Idempotent:** loading twice gives the same result.
+- **Self-cleaning:** rows that vanished from the source vanish from the DB.
+- **Atomic:** a crash mid-load rolls back, so a season is never half-loaded.
+- v1 used `INSERT … ON CONFLICT DO NOTHING`, which silently kept stale or broken rows.
+- Trade-off: replacing ~1,300 games to change one is wasteful. Per-row upserts return in L2
+  for in-season updates.
 
 ```python
-upsert_player_seasons(df, season, kind)   # players by bref_id, then the stat columns of `kind`;
-                                          # the per_game step defines the season's row set
-upsert_standings(df, season)              # adds franchise_id via etl/teams.py
-upsert_games(df, season)                  # tags game_type, then writes; raises if the
-                                          # season's standings aren't loaded yet
+load_players(df, season)     # players upserted by bref_id (they span seasons), then the season's rows
+load_standings(df, season)   # adds franchise_id via etl/teams.py
+load_games(df, season)       # tags game_type, then writes; raises if the season's standings aren't loaded
 ```
 
 Player names are always updated (BRef corrects spellings). `birth_year` keeps the earliest
@@ -248,7 +249,7 @@ python -m etl.pipeline --season 2024 --force     # ignore the checkpoint, re-par
 python -m etl.pipeline --season 2024 --refresh   # also re-download the pages
 ```
 
-- **Steps per season:** `per_game → advanced → standings → schedule`.
+- **Steps per season:** `players → standings → schedule` (`STEPS = {name: (extract, load)}`).
 - **Checkpoint per `(season, step)`, written only on success.** v1 marked a season done even
   when steps failed, which hid the broken standings. A failed step is printed, reported in a
   summary, and retried on the next run. The exit code is 1 if anything failed, or 2 on a rate
@@ -269,20 +270,24 @@ straight into a model.
 
 | Check | Catches |
 |---|---|
-| All 4 steps checkpointed for every season `1980 … last_completed_season()`; every season has games, standings and players | A season that silently never loaded |
+| All 3 steps checkpointed for every season `1980 … last_completed_season()`; every season has games, standings and players | A season that silently never loaded |
 | Home-win rate (regular, non-neutral games) in [0.53, 0.66] overall, ≥ 0.50 per season except 2021 | Inverted scores (v1: 0.394) |
 | Every game has a `game_type` and a `neutral` flag; all 2020 bubble games are neutral | Missed inference / migration |
 | Standings W/L == W/L recomputed from regular-season games | Cup final or playoff misclassification, missing games |
 | 22–30 teams per season across both conferences | Missing West / division tables |
 | 1999 = 50 and 2012 = 66 games per team | Lockout handling |
-| No `UNK` team, every player has a `bref_id`, exactly one primary row per player-season | Team column renames, identity bugs |
+| No `UNK` team, exactly one primary row per player-season (`bref_id` is `NOT NULL` in the schema, so no check needed) | Team column renames, identity bugs |
 | 250–700 primary player rows per season; advanced stats wherever minutes were played | Partial loads |
 | **Box totals:** Σ(player PPG × games) per team == PS/G × games (±1%; real max error 0.27%) | Missing players, wrong team attribution |
 | Traded players: TOT games == sum of their per-team games | Broken `2TM/3TM` handling |
 | 30 franchises, all active; every retired abbreviation maps to a franchise | A relocation missing from `etl/teams.py` |
 | Spot check: LAL 107 @ DEN 119 on 2023-10-24 | The exact game v1 stored backwards |
 
-Add a spot check (`KNOWN_GAMES`) whenever you verify a result against a box score.
+Each check is one SQL query in `CHECKS` that returns the rows breaking the rule; it passes when
+nothing comes back. Add a row to the `known results` check's `VALUES` list whenever you
+verify a result against a box score. `tests/test_validate.py` re-injects past bugs
+(swapped scores, missing West, `UNK` teams…) in rolled-back transactions and asserts that
+the right check catches each one.
 
 ---
 
@@ -307,6 +312,7 @@ pytest -q                                # parsers, game types, scraper, loader 
 | `test_game_types.py` | nothing | quota logic, play-in, Cup final (both labels), unknown teams |
 | `test_scraper.py` | nothing (network faked) | cache hits, `--refresh`, `.404` memory, 429 → `RateLimited` with nothing cached |
 | `test_loader.py` | `TEST_DATABASE_URL` (skipped otherwise) | loading twice changes nothing; per-game + advanced fill one wide row; Dončić's TOT/DAL/LAL rows; name corrections propagate; rows dropped from the source are deleted; games need standings; the franchise views |
+| `test_validate.py` | a fully loaded `DATABASE_URL` (skipped otherwise) | mutation tests: each re-injected past bug is caught by the right check |
 
 `test_loader.py` drops and recreates the schema in the test DB, and refuses to run if
 `TEST_DATABASE_URL` equals `DATABASE_URL`.
@@ -332,7 +338,7 @@ the network.
 | `standings W/L ≠ games` in validate | A non-counting game was classified as regular (new tournament format?) | Look at that season's `remarks`, extend `infer_game_types` and add a case to `test_game_types.py` |
 | `RuntimeError: no standings for Y` | Schedule step run before standings | `python -m etl.pipeline --season Y` (runs the steps in order) |
 | `box totals` fails for one team-season | A player row missing or attributed to the wrong team | Compare that team's rows with the BRef team page; usually a parser key change |
-| New column missing in the DB | `create_all` doesn't alter tables | Add it to `MIGRATIONS` and run `python -m db.init_db` |
+| New column missing in the DB | `create_all` doesn't alter tables | `python -m db.init_db --drop`, then `python -m etl.pipeline --force` (Alembic replaces this in L1) |
 | `psycopg2` install fails | Missing libpq | `brew install libpq` |
 
 ---

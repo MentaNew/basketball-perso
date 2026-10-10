@@ -22,7 +22,7 @@ Files: `ml/features.py` (career-sequence section), `ml/player_lstm.py`, `tests/t
 ## Step 1 — Career table (`career_table`)
 
 ```python
-df = load_player_seasons(min_games=20)               # primary rows (TOT for traded players)
+df = read_player_seasons(min_games=20)               # primary rows (TOT for traded players)
 df = df.dropna(subset=LSTM_STAT_COLS + ["mp", "age"])
 df["gap"] = seasons since the player's previous qualifying season (1 = consecutive, capped at 3)
 ```
@@ -166,7 +166,7 @@ predict_next_season("LeBron James")
 It returns `None` when the player has fewer than 4 qualifying seasons (g ≥ 20) or a gap of
 more than one missed season in the window. Example: Wembanyama has only 2 seasons.
 
-`_load()` sets `torch.set_num_threads(1)` because of the macOS OpenMP clash with xgboost in
+`load_bundle()` sets `torch.set_num_threads(1)` because of the macOS OpenMP clash with xgboost in
 the same process (see Phase 2).
 
 ---
@@ -190,7 +190,7 @@ Checks:
 | Problem | Cause | Fix |
 |---|---|---|
 | `RuntimeError: validation loss is NaN` | Bad input row or exploding gradients | Check `career_table()` for NaN or inf; lower the LR |
-| Process hangs at the first prediction inside the app | OpenMP clash | Keep `set_num_threads(1)` in `_load()` |
+| Process hangs at the first prediction inside the app | OpenMP clash | Keep `set_num_threads(1)` in `load_bundle()` |
 | Val loss differs between runs on MPS | Non-deterministic GPU kernels | Train with `device=cpu` for exact reproducibility |
 | Projection is `None` for an active player | < 4 seasons with 20+ games | Expected; the UI explains it |
 

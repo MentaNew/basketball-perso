@@ -25,7 +25,7 @@ sit from their contemporaries, not by absolute numbers.
 ## Step 1 — Features (`build_similarity_features`)
 
 ```python
-df = load_player_seasons(min_games=41)   # primary rows only (TOT for traded players)
+df = read_player_seasons(min_games=41)   # primary rows only (TOT for traded players)
 df = df.dropna(subset=["pts", "per"])    # need both per-game and advanced stats
 for c in SIMILARITY_COLS:
     z = (df[c] - season_mean(c)) / (season_std(c) + 1e-8)
@@ -155,7 +155,7 @@ Ewing, Anthony Davis and Hakeem Olajuwon.
 
 ```python
 from ml.similarity import find_similar, get_archetypes, get_player_archetype, \
-                          get_player_archetype_history, get_umap_plot_data
+                          get_umap_plot_data
 
 find_similar("Michael Jordan", season=1991, top_k=10, cross_era=True)
 #   Kawhi Leonard 2017, Shai Gilgeous-Alexander 2025, LeBron James 2012, Clyde Drexler 1988…

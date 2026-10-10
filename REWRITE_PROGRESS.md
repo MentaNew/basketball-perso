@@ -13,10 +13,10 @@ Status log for the two-axis plan agreed on 2026-10-05. **Read this first when co
 
 ---
 
-## Where we are (last updated 2026-10-09)
+## Where we are (last updated 2026-10-10)
 
-- **Git:** branch `rewrite/minimal`. The pre-rewrite code is tagged `v0-reference` (commit
-  `2f419c1`, which is also `main`).
+- **Git:** the L0 rewrite was merged into `main` (merge commit `930ba5d`). The pre-rewrite
+  code is tagged `v0-reference` (commit `2f419c1`). New work happens on feature branches.
 - **Databases:**
   - `nba_platform_v2` is the **reference**, with full data 1980–2026. Leave it untouched; it's
     what the rewrite is compared against.
@@ -39,12 +39,12 @@ Status log for the two-axis plan agreed on 2026-10-05. **Read this first when co
 | 3 | `etl/scraper.py` (merged `get_players`) | ✅ committed (`cbd84ef`) |
 | 4 | `etl/loader.py` (replace-season pattern; column lists removed from models) | ✅ committed (`cbd84ef`) |
 | 5 | `etl/pipeline.py` (3 steps) + first full load into `nba_platform_l0` | ✅ committed (`cbd84ef`) |
-| 6 | `etl/validate.py` (declarative SQL checks) + `tests/test_validate.py` (mutation tests) | ✅ verified, **⚠️ NOT COMMITTED YET** |
-| 7 | `ml/features.py` (tidy; `read_*` renames; guaranteed `neutral` column) | ✅ verified, **⚠️ NOT COMMITTED YET** |
-| 8 | `ml/game_predictor.py` (ship raw XGBoost, drop calibration) | ✅ verified + retrained, **⚠️ NOT COMMITTED YET** |
-| 9 | `ml/similarity.py` (light tidy) | ⏭ **next** |
+| 6 | `etl/validate.py` (declarative SQL checks) + `tests/test_validate.py` (mutation tests) | ✅ merged into main (930ba5d) |
+| 7 | `ml/features.py` (tidy; `read_*` renames; guaranteed `neutral` column) | ✅ merged into main (930ba5d) |
+| 8 | `ml/game_predictor.py` (ship raw XGBoost, drop calibration) | ✅ merged into main (930ba5d) |
+| 9 | `ml/similarity.py` (light tidy) | ⏳ (branch: refactor/similarity-tidy) |
 | 10 | `ml/player_lstm.py` (keep LSTM, light tidy) | ⏳ |
-| 11 | `app/` (stale facts fixed, home-court chart excludes neutral games, neutral-site warning) | ✅ verified, **⚠️ NOT COMMITTED YET** |
+| 11 | `app/` (stale facts fixed, home-court chart excludes neutral games, neutral-site warning) | ✅ merged into main (930ba5d) |
 | 12 | Tests + docs: update `PHASE1–5` guides, write `ENGINEERING_LEVELS.md` | ⏳ |
 
 ### Module 1 — what was done (2026-10-05)
@@ -172,14 +172,14 @@ git add REWRITE_PROGRESS.md NEXT_STEPS.md ML_NEXT_STEPS.md .gitignore && git com
 
 ```bash
 cd ~/Projects/personal_projects/basketball
-git switch rewrite/minimal && git status          # modules 6-8 may still be uncommitted (see above)
+git switch main && git pull && git status         # start from an up-to-date main
 
 conda activate nba                                # or /opt/miniconda3/envs/nba/bin/python
 export PYTHONPATH=.
 pytest -q && ruff check .                         # expect 53 passed, all checks passed
 ```
 
-Then either ask Claude: **"continue the rewrite with module 9 (ml/similarity.py)"**, or work on
+Then either ask Claude: **"start module 9 on a new branch"**, or work on
 the ML problems yourself. **`ML_NEXT_STEPS.md`** is your work plan: neutral sites,
 calibration, LSTM vs Ridge, predictor features, number of archetypes, and an experiment log.
 

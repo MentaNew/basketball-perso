@@ -151,6 +151,37 @@ class Game(Base):
     game_type = Column(Text)                  # 'regular' | 'play_in' | 'playoff' | 'cup_final'
 
 
+class WinTotal(Base):
+    """Preseason betting line on each team's wins (sportsoddshistory.com), 1994 onward."""
+    __tablename__ = "win_totals"
+
+    season = Column(Integer, primary_key=True)
+    team_abr = Column(Text, primary_key=True)
+    line = Column(Float, nullable=False)       # e.g. 58.5
+    over_odds = Column(Integer)                # American odds, e.g. -110
+    under_odds = Column(Integer)
+    actual_wins = Column(Integer)              # as reported by the odds site (validated vs standings)
+
+
+class PlayerSalary(Base):
+    """One row per player on a team's payroll that season (BRef team page "Salaries" table).
+    bref_id has no foreign key: payroll includes players who never played (waived, injured)."""
+    __tablename__ = "player_salaries"
+
+    season = Column(Integer, primary_key=True)
+    team_abr = Column(Text, primary_key=True)
+    bref_id = Column(Text, primary_key=True)
+    name = Column(Text)
+    salary = Column(Integer, nullable=False)   # US dollars
+
+
+class SalaryCap(Base):
+    __tablename__ = "salary_caps"
+
+    season = Column(Integer, primary_key=True)
+    cap = Column(Integer, nullable=False)      # US dollars
+
+
 class EtlCheckpoint(Base):
     """Which (season, step) the pipeline has finished, so a run can resume."""
     __tablename__ = "etl_checkpoint"

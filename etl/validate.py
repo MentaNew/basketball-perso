@@ -13,7 +13,7 @@ import pandas as pd
 from sqlalchemy import Connection, text
 
 from db.connection import get_engine
-from etl.pipeline import SEASONS, STEPS
+from etl.pipeline import FIRST_SEASON, SEASONS, STEPS
 
 # Regular-season, non-neutral games: the ones where home-court advantage applies.
 HOME_GAMES = "game_type = 'regular' AND NOT neutral AND season = ANY(:seasons)"
@@ -22,7 +22,9 @@ CHECKS = {
     # ---- completeness
     "every ETL step finished for every season": """
         SELECT s.season, st.step
-        FROM unnest(CAST(:seasons AS int[])) s(season) CROSS JOIN unnest(CAST(:steps AS text[])) st(step)
+        FROM unnest(CAST(:seasons AS int[])) s(season)
+        CROSS JOIN unnest(CAST(:steps AS text[]), CAST(:first_seasons AS int[])) st(step, first_season)
+        WHERE s.season >= st.first_season
         EXCEPT SELECT season, step FROM etl_checkpoint""",
     "every season has games, standings and players": """
         SELECT s.season FROM unnest(CAST(:seasons AS int[])) s(season)
@@ -103,6 +105,26 @@ CHECKS = {
         WHERE t.season = ANY(:seasons)
           AND (p.player_pts IS NULL OR ABS(p.player_pts / (t.ps_g * (t.w + t.l)) - 1) > 0.01)""",
 
+    # ---- money: betting lines, payroll, cap (1994 onward)
+    # 1995-96 archive pages list only some teams; 1999 (lockout) has no lines at all
+    "every team has a preseason betting line (1994+, except 1995, 1996, 1999)": """
+        SELECT t.season, t.team_abr FROM team_seasons t
+        LEFT JOIN win_totals w USING (season, team_abr)
+        WHERE t.season >= 1994 AND t.season NOT IN (1995, 1996, 1999) AND t.season = ANY(:seasons)
+          AND w.line IS NULL""",
+    "the betting site's actual wins equal our standings": """
+        SELECT w.season, w.team_abr, w.actual_wins, t.w FROM win_totals w
+        JOIN team_seasons t USING (season, team_abr)
+        WHERE w.season = ANY(:seasons) AND w.actual_wins IS DISTINCT FROM t.w""",
+    "every team-season since 1994 has a payroll and a salary cap": """
+        SELECT t.season, t.team_abr, p.payroll, p.cap FROM team_seasons t
+        LEFT JOIN team_payrolls p USING (season, team_abr)
+        WHERE t.season >= 1994 AND t.season = ANY(:seasons) AND (p.payroll IS NULL OR p.cap IS NULL)""",
+    # real extremes: 2006 Knicks 2.56x and 2003 "Jail Blazers" 2.62x the cap
+    "payrolls are plausible (35-300% of the cap)": """
+        SELECT season, team_abr, payroll, cap, ROUND(payroll_to_cap::numeric, 2) AS ratio FROM team_payrolls
+        WHERE season = ANY(:seasons) AND payroll_to_cap NOT BETWEEN 0.35 AND 3.0""",
+
     # ---- franchises
     "30 franchises, all active in the latest season": """
         SELECT franchise_id, last_season FROM franchises
@@ -117,7 +139,8 @@ CHECKS = {
 
 def run_checks(conn: Connection, seasons: list[int]) -> dict[str, pd.DataFrame]:
     """{check name: offending rows}; a check passed when its DataFrame is empty."""
-    params = {"seasons": seasons, "steps": list(STEPS)}
+    params = {"seasons": seasons, "steps": list(STEPS),
+              "first_seasons": [FIRST_SEASON.get(step, SEASONS[0]) for step in STEPS]}
     return {name: pd.read_sql_query(text(sql), conn, params=params) for name, sql in CHECKS.items()}
 
 

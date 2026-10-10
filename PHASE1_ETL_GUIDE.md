@@ -249,7 +249,9 @@ python -m etl.pipeline --season 2024 --force     # ignore the checkpoint, re-par
 python -m etl.pipeline --season 2024 --refresh   # also re-download the pages
 ```
 
-- **Steps per season:** `players → standings → schedule` (`STEPS = {name: (extract, load)}`).
+- **Steps per season:** `players → standings → schedule → win_totals → salaries`
+  (`STEPS = {name: (extract, load)}`). The last two only run from 1994 (`FIRST_SEASON`): the
+  betting-line archive starts in 1993-94.
 - **Checkpoint per `(season, step)`, written only on success.** v1 marked a season done even
   when steps failed, which hid the broken standings. A failed step is printed, reported in a
   summary, and retried on the next run. The exit code is 1 if anything failed, or 2 on a rate
@@ -270,7 +272,7 @@ straight into a model.
 
 | Check | Catches |
 |---|---|
-| All 3 steps checkpointed for every season `1980 … last_completed_season()`; every season has games, standings and players | A season that silently never loaded |
+| Every step checkpointed for every season it applies to (`FIRST_SEASON`); every season has games, standings and players | A season that silently never loaded |
 | Home-win rate (regular, non-neutral games) in [0.53, 0.66] overall, ≥ 0.50 per season except 2021 | Inverted scores (v1: 0.394) |
 | Every game has a `game_type` and a `neutral` flag; all 2020 bubble games are neutral | Missed inference / migration |
 | Standings W/L == W/L recomputed from regular-season games | Cup final or playoff misclassification, missing games |

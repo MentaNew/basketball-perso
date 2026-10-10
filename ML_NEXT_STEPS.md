@@ -25,7 +25,7 @@ get as close as possible to the betting markets' preseason lines.
 | Same as last season | 8.29 |
 | Last season regressed 30% to 41 | **7.66** |
 | Linear on last season's net rating | 7.58 (in-sample) |
-| **Vegas preseason line** (856 full seasons, 1994–2026) | **6.67**: the real benchmark |
+| **Vegas preseason line** (824 full team-seasons with a line, 1994–2026) | **6.67**: the real benchmark |
 
 **The gap to close is ~1 win per team (7.66 → 6.67).** Vegas's biggest misses are star
 injuries (2025 76ers 50.5 → 24, 1997 Spurs 50.5 → 20), so availability and age risk are where

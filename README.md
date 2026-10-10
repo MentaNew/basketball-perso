@@ -43,7 +43,7 @@ python -m ml.player_lstm train
 pytest && ruff check .
 ```
 
-ETL flags: `--start/--end` (season range), `--steps players standings schedule`,
+ETL flags: `--start/--end` (season range), `--steps players standings schedule win_totals salaries`,
 `--force` (re-parse from the HTML cache, ignoring the checkpoint), `--refresh` (re-download).
 The season range ends at the last completed season: season `Y` counts as complete from
 July 1 of `Y`. New seasons are picked up automatically by a plain `python -m etl.pipeline`.

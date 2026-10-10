@@ -33,6 +33,12 @@ VIEWS = {
         WINDOW w AS (PARTITION BY franchise_id)
         -- teams.last_season: the source column; a bare last_season would mean the window result
         ORDER BY franchise_id, teams.last_season DESC""",
+    # Team payroll per season and as a share of the cap ("financial flexibility").
+    "team_payrolls": """
+        SELECT s.season, s.team_abr, SUM(s.salary) AS payroll, COUNT(*) AS players, c.cap,
+               SUM(s.salary)::float / c.cap AS payroll_to_cap
+        FROM player_salaries s LEFT JOIN salary_caps c USING (season)
+        GROUP BY s.season, s.team_abr, c.cap""",
 }
 
 

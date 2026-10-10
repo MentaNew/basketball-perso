@@ -1,12 +1,16 @@
-"""Career-arc LSTM: predict next-season per-game stats from the previous 4 seasons.
+"""Career-arc LSTM: predict a player's next-season per-game stats from his previous 4 seasons.
 
-Split is temporal (by target season), so no player-window leaks across train/val/test
-(§7.7).  Inputs include age and season gaps.  Every run is compared to baselines.
+- Split by *target season* (train <= 2016, validation 2017-20, test 2021+), so the model is
+  always evaluated on the future, exactly as it is used.
+- Inputs include age and season gaps (ml.features.LSTM_INPUT_COLS).
+- Every run is scored against three baselines, in real units: Ridge regression on the same
+  window, a recency-weighted average, and "same as last season".
 
 Usage: python -m ml.player_lstm train
 """
 import argparse
 import copy
+from functools import cache
 from pathlib import Path
 
 import joblib
@@ -19,6 +23,7 @@ from torch import nn
 from ml.features import (
     LSTM_INPUT_COLS,
     LSTM_STAT_COLS,
+    MAX_GAP,
     SEQ_IN,
     build_career_sequences,
     career_table,
@@ -31,12 +36,12 @@ META_PATH = MODELS_DIR / "player_lstm_meta.pkl"
 
 HIDDEN_DIM, N_LAYERS, DROPOUT = 128, 2, 0.3
 LR, WEIGHT_DECAY, EPOCHS, BATCH_SIZE, PATIENCE = 1e-3, 1e-5, 80, 64, 15
-TRAIN_MAX_SEASON, VAL_MAX_SEASON = 2016, 2020   # test = target seasons after 2020
-STAT_IDX = [LSTM_INPUT_COLS.index(c) for c in LSTM_STAT_COLS]
+TRAIN_MAX_SEASON, VAL_MAX_SEASON = 2016, 2020
+STAT_IDX = [LSTM_INPUT_COLS.index(c) for c in LSTM_STAT_COLS]  # where the targets sit in the inputs
 
 
 def get_device() -> torch.device:
-    if torch.backends.mps.is_available():
+    if torch.backends.mps.is_available():  # Apple Silicon GPU
         return torch.device("mps")
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -54,7 +59,8 @@ class CareerLSTM(nn.Module):
 
     def forward(self, x):
         out, _ = self.lstm(x)
-        # residual on the last season: the net learns the *change*, which is easier
+        # Residual: start from last season's stats and learn only the *change*, which is
+        # far easier than predicting the absolute values.
         return x[:, -1, STAT_IDX] + self.head(self.dropout(out[:, -1, :]))
 
 
@@ -65,86 +71,106 @@ def baseline_last_season(X: np.ndarray) -> np.ndarray:
 
 
 def baseline_weighted(X: np.ndarray, weights=(2, 3, 4, 5)) -> np.ndarray:
-    """Marcel-style recency-weighted average of the input seasons (oldest -> newest)."""
+    """Marcel-style recency-weighted average of the 4 input seasons (oldest -> newest)."""
     w = np.array(weights, dtype=np.float32)[:, None]
     return (X[:, :, STAT_IDX] * w).sum(1) / w.sum()
 
 
-def mae_table(y: np.ndarray, preds: dict[str, np.ndarray]) -> pd.DataFrame:
-    rows = {name: np.abs(p - y).mean(0) for name, p in preds.items()}
-    t = pd.DataFrame(rows, index=LSTM_STAT_COLS).T
-    t["mean_norm_mae"] = (np.abs(np.stack(list(preds.values())) - y) / y.std(0)).mean((1, 2))
-    return t
+def mae_table(y: np.ndarray, predictions: dict[str, np.ndarray]) -> pd.DataFrame:
+    """MAE per stat in real units, plus `mean_norm_mae` (each stat's MAE / its std, averaged)."""
+    table = pd.DataFrame({name: np.abs(p - y).mean(0) for name, p in predictions.items()},
+                         index=LSTM_STAT_COLS).T
+    table["mean_norm_mae"] = (np.abs(np.stack(list(predictions.values())) - y) / y.std(0)).mean((1, 2))
+    return table
 
 
 # ---------------------------------------------------------------- training
 
-def train():
-    torch.manual_seed(42)
-    np.random.seed(42)
-    seq = build_career_sequences(career_table())
-    X, y, meta = seq["X"], seq["y"], seq["meta"]
-    tr = (meta.target_season <= TRAIN_MAX_SEASON).values
-    va = ((meta.target_season > TRAIN_MAX_SEASON) & (meta.target_season <= VAL_MAX_SEASON)).values
-    te = (meta.target_season > VAL_MAX_SEASON).values
-    print(f"Windows: train {tr.sum():,} (≤{TRAIN_MAX_SEASON}), val {va.sum():,}, "
-          f"test {te.sum():,} (>{VAL_MAX_SEASON})")
+class Normalizer:
+    """z-scores inputs and targets with statistics from the *training* windows only."""
 
-    x_mean, x_std = X[tr].reshape(-1, X.shape[2]).mean(0), X[tr].reshape(-1, X.shape[2]).std(0) + 1e-6
-    y_mean, y_std = x_mean[STAT_IDX], x_std[STAT_IDX]
-    norm_x = lambda a: (a - x_mean) / x_std  # noqa: E731
-    norm_y = lambda a: (a - y_mean) / y_std  # noqa: E731
+    def __init__(self, X_train: np.ndarray):
+        flat = X_train.reshape(-1, X_train.shape[2])
+        self.x_mean, self.x_std = flat.mean(0), flat.std(0) + 1e-6
+        self.y_mean, self.y_std = self.x_mean[STAT_IDX], self.x_std[STAT_IDX]
 
-    device = get_device()
-    model = CareerLSTM(len(LSTM_INPUT_COLS), HIDDEN_DIM, N_LAYERS, len(LSTM_STAT_COLS),
-                       DROPOUT).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=8, factor=0.5)
+    def x(self, X: np.ndarray) -> np.ndarray:
+        return (X - self.x_mean) / self.x_std
+
+    def y(self, y: np.ndarray) -> np.ndarray:
+        return (y - self.y_mean) / self.y_std
+
+    def y_back(self, y_norm: np.ndarray) -> np.ndarray:
+        return y_norm * self.y_std + self.y_mean
+
+
+def fit_lstm(X_train, y_train, X_val, y_val, device) -> tuple[CareerLSTM, float]:
+    """Train on normalised arrays with early stopping; return the best-on-validation model."""
+    model = CareerLSTM(len(LSTM_INPUT_COLS), HIDDEN_DIM, N_LAYERS, len(LSTM_STAT_COLS), DROPOUT).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=8, factor=0.5)
     loss_fn = nn.MSELoss()
-    t = lambda a: torch.tensor(a, dtype=torch.float32, device=device)  # noqa: E731
-    Xtr, ytr, Xva, yva = t(norm_x(X[tr])), t(norm_y(y[tr])), t(norm_x(X[va])), t(norm_y(y[va]))
+    X_train, y_train, X_val, y_val = (torch.tensor(a, dtype=torch.float32, device=device)
+                                      for a in (X_train, y_train, X_val, y_val))
 
-    best, best_state, stale = float("inf"), None, 0
+    best_loss, best_state, epochs_without_gain = float("inf"), None, 0
     for epoch in range(1, EPOCHS + 1):
         model.train()
-        perm = torch.randperm(len(Xtr), device=device)
-        for i in range(0, len(perm), BATCH_SIZE):
-            b = perm[i:i + BATCH_SIZE]
-            opt.zero_grad()
-            loss = loss_fn(model(Xtr[b]), ytr[b])
+        order = torch.randperm(len(X_train), device=device)
+        for start in range(0, len(order), BATCH_SIZE):
+            batch = order[start:start + BATCH_SIZE]
+            optimizer.zero_grad()
+            loss = loss_fn(model(X_train[batch]), y_train[batch])
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
+            optimizer.step()
+
         model.eval()
         with torch.no_grad():
-            val = loss_fn(model(Xva), yva).item()
-        sched.step(val)
-        if np.isnan(val):
+            val_loss = loss_fn(model(X_val), y_val).item()
+        if np.isnan(val_loss):
             raise RuntimeError("validation loss is NaN")
-        if val < best - 1e-5:
-            best, best_state, stale = val, copy.deepcopy(model.state_dict()), 0
+        scheduler.step(val_loss)
+        if val_loss < best_loss - 1e-5:
+            best_loss, best_state, epochs_without_gain = val_loss, copy.deepcopy(model.state_dict()), 0
         else:
-            stale += 1
+            epochs_without_gain += 1
         if epoch % 10 == 0 or epoch == 1:
-            print(f"  epoch {epoch:>3}  val_mse(norm) {val:.4f}  best {best:.4f}")
-        if stale >= PATIENCE:
+            print(f"  epoch {epoch:>3}  val_mse(norm) {val_loss:.4f}  best {best_loss:.4f}")
+        if epochs_without_gain >= PATIENCE:
             print(f"  early stop at epoch {epoch}")
             break
+
     model.load_state_dict(best_state)
-    model.eval()
+    return model.eval(), best_loss
 
-    def predict(a):
-        with torch.no_grad():
-            return model(t(norm_x(a))).cpu().numpy() * y_std + y_mean
 
-    ridge = Ridge(alpha=1.0).fit(norm_x(X[tr]).reshape(tr.sum(), -1), y[tr])
-    preds = {
-        "lstm": predict(X[te]),
-        "ridge": ridge.predict(norm_x(X[te]).reshape(te.sum(), -1)),
-        "weighted_avg": baseline_weighted(X[te]),
-        "last_season": baseline_last_season(X[te]),
-    }
-    report = mae_table(y[te], preds)
+def train() -> pd.DataFrame:
+    torch.manual_seed(42)
+    np.random.seed(42)
+    windows = build_career_sequences(career_table())
+    X, y, target_season = windows["X"], windows["y"], windows["meta"]["target_season"].to_numpy()
+    train_rows = target_season <= TRAIN_MAX_SEASON
+    val_rows = (target_season > TRAIN_MAX_SEASON) & (target_season <= VAL_MAX_SEASON)
+    test_rows = target_season > VAL_MAX_SEASON
+    print(f"Windows: train {train_rows.sum():,} (≤{TRAIN_MAX_SEASON}), val {val_rows.sum():,}, "
+          f"test {test_rows.sum():,} (>{VAL_MAX_SEASON})")
+
+    norm = Normalizer(X[train_rows])
+    device = get_device()
+    model, best_val_loss = fit_lstm(norm.x(X[train_rows]), norm.y(y[train_rows]),
+                                    norm.x(X[val_rows]), norm.y(y[val_rows]), device)
+
+    with torch.no_grad():
+        lstm_test = model(torch.tensor(norm.x(X[test_rows]), dtype=torch.float32, device=device))
+    flat = lambda rows: norm.x(X[rows]).reshape(rows.sum(), -1)  # noqa: E731  (window -> 1 row)
+    ridge = Ridge(alpha=1.0).fit(flat(train_rows), y[train_rows])
+    report = mae_table(y[test_rows], {
+        "lstm": norm.y_back(lstm_test.cpu().numpy()),
+        "ridge": ridge.predict(flat(test_rows)),
+        "weighted_avg": baseline_weighted(X[test_rows]),
+        "last_season": baseline_last_season(X[test_rows]),
+    })
     print(f"\nTest MAE in real units (target seasons > {VAL_MAX_SEASON}):")
     print(report.round(4).to_string())
 
@@ -152,8 +178,8 @@ def train():
     torch.save(model.cpu().state_dict(), WEIGHTS_PATH)
     joblib.dump({
         "input_cols": LSTM_INPUT_COLS, "stat_cols": LSTM_STAT_COLS,
-        "x_mean": x_mean, "x_std": x_std, "y_mean": y_mean, "y_std": y_std,
-        "best_val_loss": best, "test_report": report,
+        "x_mean": norm.x_mean, "x_std": norm.x_std, "y_mean": norm.y_mean, "y_std": norm.y_std,
+        "best_val_loss": best_val_loss, "test_report": report,
         "hparams": {"hidden_dim": HIDDEN_DIM, "n_layers": N_LAYERS, "dropout": DROPOUT},
     }, META_PATH)
     print(f"\nSaved {WEIGHTS_PATH} and {META_PATH}")
@@ -162,52 +188,48 @@ def train():
 
 # ---------------------------------------------------------------- inference
 
-_cache: dict = {}
-
-
-def _load():
-    if not _cache:
-        # xgboost and torch ship separate OpenMP runtimes on macOS; once xgboost has run in
-        # the same process (the Streamlit app), multi-threaded torch ops can deadlock.
-        torch.set_num_threads(1)
-        meta = joblib.load(META_PATH)
-        hp = meta["hparams"]
-        model = CareerLSTM(len(meta["input_cols"]), hp["hidden_dim"], hp["n_layers"],
-                           len(meta["stat_cols"]), hp["dropout"])
-        model.load_state_dict(torch.load(WEIGHTS_PATH, map_location="cpu"))
-        model.eval()
-        _cache.update(model=model, meta=meta, careers=career_table())
-    return _cache
+@cache
+def load_bundle() -> dict:
+    # xgboost and torch ship separate OpenMP runtimes on macOS; once xgboost has run in the
+    # same process (the Streamlit app), multi-threaded torch ops can deadlock.
+    torch.set_num_threads(1)
+    meta = joblib.load(META_PATH)
+    hp = meta["hparams"]
+    model = CareerLSTM(len(meta["input_cols"]), hp["hidden_dim"], hp["n_layers"],
+                       len(meta["stat_cols"]), hp["dropout"])
+    model.load_state_dict(torch.load(WEIGHTS_PATH, map_location="cpu"))
+    return {"model": model.eval(), "meta": meta, "careers": career_table()}
 
 
 def predict_next_season(player: str) -> dict | None:
-    """Projection for the season after the player's latest one.  None if fewer than 4
-    qualifying (g ≥ 20) seasons, or a gap > 1 missed season inside the window."""
-    c = _load()
-    careers, meta, model = c["careers"], c["meta"], c["model"]
+    """Projection for the season after the player's latest one. None if he has fewer than 4
+    qualifying (20+ games) seasons, or the last 4 contain a gap of more than one season."""
+    bundle = load_bundle()
+    model, meta, careers = bundle["model"], bundle["meta"], bundle["careers"]
     bref_id = resolve_player(careers, player)
     if bref_id is None:
         return None
-    hist = careers[careers.bref_id == bref_id].tail(SEQ_IN)
-    if len(hist) < SEQ_IN or (hist["gap"].iloc[1:] > 2).any():
+    history = careers[careers.bref_id == bref_id].tail(SEQ_IN)
+    if len(history) < SEQ_IN or (history["gap"].iloc[1:] > MAX_GAP).any():
         return None
-    x = hist[meta["input_cols"]].to_numpy(np.float32)[None]
+
+    window = history[meta["input_cols"]].to_numpy(np.float32)[None]
     with torch.no_grad():
-        p = model(torch.tensor((x - meta["x_mean"]) / meta["x_std"])).numpy()[0]
-    pred = p * meta["y_std"] + meta["y_mean"]
+        prediction = model(torch.tensor((window - meta["x_mean"]) / meta["x_std"])).numpy()[0]
+    prediction = prediction * meta["y_std"] + meta["y_mean"]
     return {
-        "player": hist["name"].iat[0],
-        "based_on_seasons": hist["season"].tolist(),
-        "target_season": int(hist["season"].iat[-1]) + 1,
-        "age_next": int(hist["age"].iat[-1]) + 1,
-        "predicted_next_season": dict(zip(meta["stat_cols"], map(float, pred), strict=True)),
-        "last_season": dict(zip(meta["stat_cols"],
-                                map(float, hist[meta["stat_cols"]].iloc[-1]), strict=True)),
+        "player": history["name"].iat[0],
+        "based_on_seasons": history["season"].tolist(),
+        "target_season": int(history["season"].iat[-1]) + 1,
+        "age_next": int(history["age"].iat[-1]) + 1,
+        "predicted_next_season": dict(zip(meta["stat_cols"], map(float, prediction), strict=True)),
+        "last_season": dict(zip(meta["stat_cols"], map(float, history[meta["stat_cols"]].iloc[-1]),
+                                strict=True)),
     }
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["train"])
-    ap.parse_args()
+    parser = argparse.ArgumentParser(description="Train the career-arc LSTM.")
+    parser.add_argument("command", choices=["train"])
+    parser.parse_args()
     train()

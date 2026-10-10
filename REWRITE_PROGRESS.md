@@ -44,7 +44,7 @@ Status log for the two-axis plan agreed on 2026-10-05. **Read this first when co
 | 8 | `ml/game_predictor.py` (ship raw XGBoost, drop calibration) | ✅ verified + retrained, **⚠️ NOT COMMITTED YET** |
 | 9 | `ml/similarity.py` (light tidy) | ⏭ **next** |
 | 10 | `ml/player_lstm.py` (keep LSTM, light tidy) | ⏳ |
-| 11 | `app/` (adapt to API changes) | ⏳ |
+| 11 | `app/` (stale facts fixed, home-court chart excludes neutral games, neutral-site warning) | ✅ verified, **⚠️ NOT COMMITTED YET** |
 | 12 | Tests + docs: update `PHASE1–5` guides, write `ENGINEERING_LEVELS.md` | ⏳ |
 
 ### Module 1 — what was done (2026-10-05)

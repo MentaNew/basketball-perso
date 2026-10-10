@@ -24,7 +24,6 @@ if career.empty:
     st.warning("No seasons found.")
     st.stop()
 
-last = career.iloc[-1]
 cols = st.columns(5)
 for col, (label, value) in zip(cols, [
     ("Seasons", len(career)),

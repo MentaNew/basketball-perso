@@ -1,158 +1,113 @@
-# ML Next Steps — the problems to solve
+# ML Roadmap
 
-Your work plan for the machine-learning side. Each item is a **problem** with evidence, the
-steps to solve it, a "done when" you can check, and the files involved. Ordered by priority.
-Broader engineering items live in `NEXT_STEPS.md`; rewrite status lives in `REWRITE_PROGRESS.md`.
+Three tracks, in priority order. Each track is a sequence of feature branches
+(`ml/<track>-<step>`), merged into `main` one at a time.
 
-## Ground rules (apply to every item)
+**Ground rules (every step):**
+- Never tune on test seasons.
+- Always compare with the baselines.
+- Log every run in `models/metrics.jsonl` (track X).
+- Keep `tests/test_features.py` (the leakage test) green.
 
-1. **Never tune on the test seasons.** The last 2 seasons (2025, 2026) are held out. Develop
-   with `TimeSeriesSplit` or a validation season (e.g. 2024), and score the test seasons once,
-   at the end.
-2. **Always compare against the baselines.** A change that beats the current model but not
-   Elo / Ridge / last-season is not a win.
-3. **One change at a time, logged.** Write down every run (date, change, validation metrics)
-   in a `metrics.jsonl` or a notebook table, so you can tell what actually helped.
-4. **Keep the leakage test green** (`tests/test_features.py`) whenever you add a game feature.
+---
 
-## Step 0 — Setup (before any ML work)
+## Track A — Predict next season's team records *(highest priority)*
 
-```bash
-git status                       # commit the pending rewrite modules 6-8 first
-                                 # (commands in REWRITE_PROGRESS.md)
-git switch -c ml/<problem-name>  # one branch per problem below
-export PYTHONPATH=. && pytest -q # 53 passed = clean starting point
-```
+**Goal:** before a season starts, predict each team's wins, and beat simple rules first, then
+get as close as possible to the betting markets' preseason lines.
 
-Current numbers to beat (held out: 2024-25 and 2025-26):
+**Where we start** (team-seasons 1990–2026; lockout and COVID seasons excluded; wins scaled to
+82 games). Mean absolute error in wins:
 
-| Model | Metric | Now | Baseline |
+| Baseline | MAE (wins) |
+|---|---|
+| Always 41 | 10.48 |
+| Same as last season | 8.29 |
+| Last season regressed 30% to 41 | **7.66** |
+| Linear on last season's net rating | 7.58 (in-sample) |
+| **Vegas preseason line** (856 full seasons, 1994–2026) | **6.67**: the real benchmark |
+
+**The gap to close is ~1 win per team (7.66 → 6.67).** Vegas's biggest misses are star
+injuries (2025 76ers 50.5 → 24, 1997 Spurs 50.5 → 20), so availability and age risk are where
+a model can find an edge. Lines also lean slightly high: unders 50.2% vs overs 45.7%.
+
+**Early finding:** last season's *progression* (wins Y-1 − Y-2) has ~0 correlation (+0.008)
+with what the regressed baseline misses. Test it properly, but expect it to be weak.
+
+### A0 — Data *(branch `data/win-totals-payroll`)*
+Raw pages are already downloaded into `data/raw/` (see `DATA.md`). Load them:
+1. `win_totals` table: season, team, line, over/under odds, actual wins. Source:
+   `data/raw/odds/win_totals_{season}.html`, seasons 1994–2026 (no 1999: lockout). The
+   archive only fills a season once it ends, so **2026-27 lines need another source**
+   (the Kalshi `KXNBAWINS` ladder has them, live; see `SIDE_PROJECTS.md`).
+   - Validation: about 30 teams per season, and `actual_wins` equals our standings wins.
+   - Map team names → `team_abr` with `team_seasons.full_name`.
+2. `team_payrolls` table (team, season, total payroll) from the hidden `salaries2` table on
+   `data/raw/{season}/team_{ABR}.html`, 1994–2026. This page type **does** hide its table in an
+   HTML comment, so bring back comment search for it, with a test fixture.
+3. `salary_caps` table from BRef's `/contracts/salary-cap-history.html` (one page).
+
+### A1 — Baselines and evaluation harness *(branch `ml/season-wins-baselines`)*
+`ml/season_wins.py` with a `score(predictions)` function that reports MAE and RMSE in wins
+for a season range. Reproduce the table above, **add the Vegas line**, and freeze the split:
+train ≤ 2021, validation 2022–2024, test 2025–2026.
+
+### A2 — Features *(branch `ml/season-wins-features`)*, all known before opening night
+| Feature | Source | Note |
+|---|---|---|
+| Last season win%, net rating, SRS, end-of-season Elo | `team_seasons`, game-model snapshots | net rating usually beats record |
+| Progression (Y-1 vs Y-2) | `team_seasons` | expect weak (see above) |
+| **Roster strength** | `player_seasons` | Σ over the season-Y roster of each player's Y-1 BPM / WS48 / VORP, weighted by his Y-1 minutes |
+| Roster continuity | `player_seasons` | share of last season's minutes that returns |
+| Age profile | `player_seasons` | minutes-weighted age; young teams improve |
+| Projected player stats | career model (track C) | upgrade over raw Y-1 stats |
+| Payroll / cap, luxury-tax flag | A0 tables | your "financial flexibility" hypothesis |
+
+⚠️ **Leakage trap (roster):** the season-Y roster built from `player_seasons` knows who
+*actually* played for the team, including mid-season trades. Use each player's **first** team
+of season Y (the first entry in `team_list`), and weight by **Y-1** minutes, never Y minutes.
+Document the remaining leak (a player injured before he ever played is invisible).
+
+### A3 — Model *(branch `ml/season-wins-model`)*
+About 950 training rows, so start with **Ridge / linear regression**. Try gradient boosting only
+if it beats Ridge on validation. Target: wins per 82 games.
+- **Done when:** test MAE clearly beats 7.66, and the gap to Vegas is measured and reported.
+
+### A4 — Product *(branch `feature/season-projections-page`)*
+A Streamlit page with 2026-27 projected wins vs the 2026-27 Vegas lines, highlighting the
+biggest disagreements.
+
+---
+
+## Track B — Game-by-game model (regular season + playoff mode)
+
+**Now:** XGBoost on Elo/form features, held-out 0.670 accuracy / 0.610 log-loss; Elo alone
+0.661 / 0.619.
+
+| Step | Branch | What | Done when |
 |---|---|---|---|
-| Game predictor (XGBoost) | log-loss / accuracy | **0.610 / 0.670** | Elo 0.619 / 0.661 |
-| Next-season LSTM | mean normalised MAE | **0.364** | Ridge **0.350** (better!) |
-| Similarity | (no metric yet) | 9 clusters, fixed k | — |
+| B1 | `ml/elo-tuning` | Tune Elo's K, home advantage, season carry-over and margin multiplier by log-loss on train seasons (grid search). Give the playoffs their own home-advantage value | Elo-only validation log-loss improves; constants documented |
+| B2 | `ml/neutral-sites` | Fix the over-reaction to neutral sites: OKC–BOS goes 0.62 → 0.50. Train on each game twice (teams swapped) with a `home_court` = +1/−1/0 input | Equal teams at a neutral site ≈ 0.50; held-out log-loss ≤ 0.610; remove the app warning |
+| B3 | `ml/playoff-mode` | Evaluate playoff games separately (n ≈ 80/season). Add series state (game number, series score) and rest; a separate model or an interaction, whichever validates better | Playoff log-loss reported and better than Elo on playoffs |
+| B4 | `ml/calibration` | Reliability diagram + calibration error; raw vs isotonic vs sigmoid chosen on one validation season | Choice justified by numbers; calibration error shown in the app |
+| B5 | `ml/game-features` | Rest difference, games in the last 7 days, travel | Held-out log-loss < 0.610 |
+| B6 | `feature/series-simulator` | Monte-Carlo best-of-7 using playoff mode | Series win % and length distribution in the app |
 
 ---
 
-## Problem 1 — The game model gets neutral sites wrong *(highest priority)*
+## Track C — Finalize the player models
 
-**Evidence:** OKC (68-14, the best team) vs BOS: 62% at home, but **50%** on a neutral
-site. Elo says the home edge is only a few points. Only 207 of ~56k training games are
-neutral, mostly near coin-flip 2020 bubble games, so the tree model learned "neutral means
-50/50".
-
-**Steps**
-1. Write a test first: two teams with identical snapshots on a neutral site → p ≈ 0.50, and
-   for one real matchup, home p − neutral p ≈ Elo's home edge (a few points, not 12).
-2. Try **symmetric augmentation**: train on each game twice, once as is and once with the
-   teams swapped (target flipped, `home_*` ↔ `away_*`), plus an explicit `home_court` input
-   (+1 home, −1 away, 0 neutral). Home advantage then becomes a single learned feature.
-3. Alternative, simpler: drop `is_neutral` from the model and adjust the logit afterwards
-   using the home-court effect estimated on non-neutral games.
-4. Compare both on validation log-loss. Neither may be worse than 0.610.
-
-**Done when:** the step 1 test passes **and** held-out log-loss ≤ 0.610.
-**Files:** `ml/features.py` (`matchup_features`, `build_game_features`),
-`ml/game_predictor.py`, `tests/test_features.py`.
+| Step | Branch | What | Done when |
+|---|---|---|---|
+| C1 | `ml/projection-vs-ridge` | The career LSTM loses to Ridge (0.364 vs 0.350 normalised MAE): add advanced-stat inputs, use Ridge as the base, light tuning. Ship Ridge if the LSTM still loses | Shipped model beats Ridge on validation, then test. Feeds A2 |
+| C2 | `ml/archetype-k` | Choose the number of clusters with silhouette score + stability across seeds | k chosen with a plot and a reason; labels survive a spot-check |
+| C3 | `ml/similarity-eval` | Sanity set: 20 known "comps" pairs that should rank high | Retrieval rate reported; regressions caught |
 
 ---
 
-## Problem 2 — Are the game probabilities trustworthy? (calibration)
+## Track X — Experiment log *(do with A1)*
+Every `train()` appends one line to `models/metrics.jsonl`: timestamp, git commit, model,
+data row counts, validation and test metrics. A notebook plots the history.
 
-**Evidence:** isotonic calibration, fit with `TimeSeriesSplit` folds, made log-loss worse
-(0.614 vs 0.610), so the shipped model is raw. Nobody has looked at a reliability curve yet:
-is "70%" really 70%?
-
-**Steps**
-1. Plot a reliability diagram (10 bins: predicted vs actual home-win rate) on the validation
-   season, and compute the expected calibration error (ECE).
-2. If it's miscalibrated: fit isotonic **and** sigmoid (Platt) calibration on **one held-out
-   training season** (not folds), and compare log-loss, Brier and ECE.
-3. Ship the best of raw / isotonic / sigmoid, chosen on validation, and store which one in
-   the model bundle.
-
-**Done when:** a reliability plot is in a notebook, the choice is justified by numbers, and
-ECE is reported in `test_report`.
-**Files:** `ml/game_predictor.py`, `notebooks/02_model_eval.ipynb` (new).
-
----
-
-## Problem 3 — The LSTM loses to a linear model
-
-**Evidence:** test MAE in real units: LSTM pts 2.23 vs Ridge 2.19, and Ridge wins on all 6
-stats (normalised 0.364 vs 0.350). With ~5.7k training windows, the sequence model adds
-nothing that Ridge can't already do.
-
-**Steps** (in this order; stop when the LSTM beats Ridge on validation)
-1. **Richer inputs:** add `ts_pct, usg_pct, bpm, fg3a_rate, ast_pct, trb_pct` (already in
-   `player_seasons`) to `LSTM_INPUT_COLS`. Give Ridge the same inputs too, to keep it fair.
-2. **Ridge as the base:** feed Ridge's prediction to the LSTM as its starting point instead
-   of last season (the network then learns Ridge's mistakes).
-3. **Light tuning** on validation only: hidden size (32/64/128), dropout, and epochs with
-   early stopping.
-4. If it still loses: **ship Ridge** for projections, keep the LSTM as a documented
-   experiment, and say so in the app.
-5. Bonus: predict a range (quantile loss at 10/50/90%) instead of one number. "19–25 PPG"
-   is more honest than "22.6".
-
-**Done when:** the shipped projection model beats Ridge, last-season and weighted-average on
-**validation**, then confirmed once on test, with per-stat MAE in real units reported.
-**Files:** `ml/features.py` (section 4), `ml/player_lstm.py`.
-
----
-
-## Problem 4 — Squeeze more out of the game predictor
-
-**Evidence:** XGBoost beats Elo by under 1 point of accuracy. Its features are mostly Elo,
-form and rest; schedule density, travel and playoff context are missing.
-
-**Steps** (one feature at a time; keep any that improves validation log-loss)
-1. Rest **difference** (home rest − away rest) and games played in the last 7 days.
-2. Travel: distance or time-zone change since the last game (needs a small arena-location
-   table).
-3. Playoff context: game number in the series, series score (from consecutive playoff games
-   between the same two teams).
-4. Light hyperparameter search (`max_depth`, `min_child_weight`, `n_estimators`) inside
-   `TimeSeriesSplit`.
-
-**Done when:** held-out log-loss < 0.610 with the leakage test still passing.
-**Files:** `ml/features.py` (`TeamState`, `matchup_features`), `ml/game_predictor.py`.
-
----
-
-## Problem 5 — Is 9 the right number of player archetypes?
-
-**Evidence:** `k = 9` was inherited from v1, never chosen. Labels look right for stars and
-bigs, but some are debatable (Klay Thompson 2026 → "Bench Shooter").
-
-**Steps**
-1. For k = 6…14: silhouette score, plus **stability**, i.e. cluster agreement (adjusted
-   Rand index) across 5 random seeds.
-2. Pick the k that is stable *and* interpretable, then check that the template names still
-   fit the centroids.
-3. Spot-check 10 well-known players per archetype.
-
-**Done when:** k is chosen with a plot and a written reason, and the labels survive the
-spot-check.
-**Files:** `ml/similarity.py`, `notebooks/` (new evaluation notebook).
-
----
-
-## Problem 6 — Track experiments (do this alongside Problem 1)
-
-**Steps:** every `train()` appends one line to `models/metrics.jsonl` with the timestamp, git
-commit, model name, data row count and the held-out metrics. Add a small notebook that plots
-the history.
-
-**Done when:** you can answer "did change X help?" from the log alone.
-**Files:** `ml/game_predictor.py`, `ml/similarity.py`, `ml/player_lstm.py`.
-
----
-
-## Suggested order
-
-1 (neutral sites) + 6 (metrics log) → 2 (calibration) → 3 (LSTM) → 4 (features) → 5 (archetypes).
-
-Rewrite modules 9–10 (tidying `similarity.py` and `player_lstm.py`) are still pending.
-Either ask Claude to finish them before you start Problem 3/5, or fold that tidy into your
-own work on those files.
+## Order
+A0 → A1 (+X) → A2 → A3 → B1 → B2 → A4 → B3 → C1 → the rest.

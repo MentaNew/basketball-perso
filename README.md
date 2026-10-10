@@ -7,7 +7,7 @@ Basketball-Reference scraper feeding PostgreSQL, three models, and a Streamlit d
 | Layer | What |
 |---|---|
 | Data engineering | `etl/`: cached HTML scraping → idempotent upserts → validation gate |
-| Classical ML | `ml/game_predictor.py`: XGBoost + isotonic calibration on leak-free pre-game features, compared against Elo and always-home baselines |
+| Classical ML | `ml/game_predictor.py`: XGBoost on leak-free pre-game features, compared against Elo and always-home baselines |
 | Unsupervised ML | `ml/similarity.py`: per-season z-scores → PCA(10) → KMeans(9), UMAP(2) for the map; archetype names matched to centroids |
 | Deep learning | `ml/player_lstm.py`: 2-layer LSTM over 4-season windows → next season, compared against ridge, weighted-average and last-season baselines |
 | Product | `app/`: Home, Player Profile, Team History, Leaders, Game Predictor, Archetype Explorer |
@@ -43,12 +43,12 @@ python -m ml.player_lstm train
 pytest && ruff check .
 ```
 
-ETL flags: `--start/--end` (season range), `--steps per_game advanced standings schedule`,
+ETL flags: `--start/--end` (season range), `--steps players standings schedule`,
 `--force` (re-parse from the HTML cache, ignoring the checkpoint), `--refresh` (re-download).
 The season range ends at the last completed season: season `Y` counts as complete from
 July 1 of `Y`. New seasons are picked up automatically by a plain `python -m etl.pipeline`.
-After changing the schema, re-run `python -m db.init_db` (it applies the small migrations in
-`MIGRATIONS`).
+After changing the schema: `python -m db.init_db --drop`, then `python -m etl.pipeline --force`
+(reloads from the HTML cache in ~1.5 min; Alembic migrations arrive in level L1).
 
 ## Data
 
@@ -76,13 +76,11 @@ The data covers 47 seasons, 56,454 games, 3,819 players and 1,314 team-seasons, 
 
 | model | accuracy | AUC | log-loss | Brier |
 |---|---|---|---|---|
-| XGBoost + isotonic (shipped) | 0.664 | 0.726 | 0.614 | 0.212 |
-| XGBoost raw | **0.670** | **0.730** | **0.610** | **0.210** |
+| XGBoost (shipped) | **0.670** | **0.730** | **0.610** | **0.210** |
 | Elo only | 0.661 | 0.724 | 0.619 | 0.215 |
 | always home | 0.550 | 0.500 | 0.695 | 0.251 |
 
-On this holdout, isotonic calibration slightly *hurts* compared with the raw model (see
-`NEXT_STEPS.md`).
+Isotonic calibration was tried and dropped: it made held-out log-loss worse (0.614).
 
 **Career LSTM.** Test MAE in real units on target seasons 2021–2026 (1,221 windows):
 

@@ -26,11 +26,11 @@ Phase 1 fixed the labels. This phase fixes the leakage. The rule to keep in mind
 ## Step 1 — Inputs
 
 ```python
-from ml.features import load_games
-games = load_games()   # regular + play_in + playoff, ordered by game_date, game_id
+from ml.features import read_games
+games = read_games()   # regular + play_in + playoff, ordered by game_date, game_id
 ```
 
-`load_games()` returns rows from the `games` table. The Phase 1 loader sets each game's
+`read_games()` returns rows from the `games` table. The Phase 1 loader sets each game's
 `game_type`: a team's first W+L games are its regular season, BRef marks play-in games, and
 the season's last "NBA Cup" or "In-Season Tournament" game is the non-counting `cup_final`.
 Cup finals are excluded by default.
@@ -69,9 +69,9 @@ relocated team keeps its rating.
 | Field | Meaning |
 |---|---|
 | `elo` | Rating, starts at 1505 |
-| `gp`, `wins`, `net` | Season-to-date games, wins, cumulative point differential |
-| `last10` | Deque of the last 10 (win, margin) pairs |
-| `last_date` | Date of the previous game, used for rest |
+| `games`, `wins`, `point_diff` | Season-to-date games, wins, cumulative point differential |
+| `last10` | Deque of the last 10 (won, margin) pairs |
+| `last_game` | Date of the previous game, used for rest |
 | `prev_w_pct`, `prev_net` | Last season's final values, used as priors |
 
 **Season rollover** (`start_season`): last season's record becomes the prior, and Elo regresses
@@ -159,9 +159,10 @@ burn-in       train (TimeSeriesSplit CV inside)   held-out test (always the last
                  colsample_bytree=0.8, min_child_weight=5, eval_metric="logloss", random_state=42)
    ```
    There is no `StandardScaler`, because trees don't need one.
-5. **Calibration.** `CalibratedClassifierCV(xgb, cv=TimeSeriesSplit(5), method="isotonic")`.
-   The calibration folds are time-ordered too, so calibration never peeks at the future.
-6. **Held-out report.** Four rows: calibrated XGB, raw XGB, Elo-only, always-home.
+5. **No calibration.** Isotonic calibration (fit on `TimeSeriesSplit` folds) made held-out
+   log-loss worse (0.614 vs 0.610), so the model ships raw. A proper calibration study is
+   problem 2 in `ML_NEXT_STEPS.md`.
+6. **Held-out report.** Three rows: XGBoost, Elo-only, always-home.
 7. **Final refit** on all seasons, saved with the held-out metrics. Those are the numbers
    the app shows.
 
@@ -181,8 +182,8 @@ prediction both count as "correct" for accuracy.
 
 | model | accuracy | AUC | log-loss | Brier |
 |---|---|---|---|---|
-| XGBoost + isotonic (shipped) | 0.664 | 0.726 | 0.614 | 0.212 |
-| XGBoost raw | **0.670** | **0.730** | **0.610** | **0.210** |
+| XGBoost (shipped) | **0.670** | **0.730** | **0.610** | **0.210** |
+| *(XGBoost + isotonic, tried and dropped)* | *0.664* | *0.726* | *0.614* | *0.212* |
 | Elo only | 0.661 | 0.724 | 0.619 | 0.215 |
 | always home | 0.550 | 0.500 | 0.695 | 0.251 |
 
@@ -190,12 +191,9 @@ prediction both count as "correct" for accuracy.
 - Pre-game NBA models usually land at 64–68% accuracy, because basketball has real
   randomness. If you ever see 75%+, look for leakage before celebrating.
 - XGBoost beats Elo by a small but consistent margin.
-- On this holdout, isotonic calibration slightly **hurts** compared with the raw model. Each
-  calibration fold of `TimeSeriesSplit` trains its XGBoost on less (and older) data, and
-  the raw model is already well calibrated with `logloss` as its objective. Whether to ship
-  the raw model is an open item in `NEXT_STEPS.md`.
-- The previous run, with 2023-24 and 2024-25 held out, gave 0.651 / 0.617 for the calibrated
-  model, so results move a little with the test window.
+- Isotonic calibration slightly **hurt**: each `TimeSeriesSplit` calibration fold trains its
+  XGBoost on less (and older) data, and the raw model is already reasonably calibrated with
+  `logloss` as its objective.
 
 ---
 
@@ -203,13 +201,13 @@ prediction both count as "correct" for accuracy.
 
 ```python
 {
-  "model":        CalibratedClassifierCV,      # final, fit on all seasons
+  "model":        XGBClassifier,               # final, fit on all seasons
   "feature_cols": GAME_FEATURES,
   "snapshots":    {(season, team_abr): {feature: value}},
   "cv":           DataFrame,                   # per-fold CV metrics
-  "test_report":  DataFrame,                   # the 4-row table above
+  "test_report":  DataFrame,                   # the 3-row table above
   "test_seasons": (2025, 2026),
-  "accuracy", "auc", "log_loss", "brier":  float   # calibrated XGB on the held-out seasons
+  "accuracy", "auc", "log_loss", "brier":  float   # XGBoost on the held-out seasons
 }
 ```
 
@@ -223,17 +221,18 @@ from ml.game_predictor import predict_winner, available_seasons, available_teams
 
 predict_winner("OKC", "BOS", season=2026, playoff=False, neutral=False)
 # {'home_team': 'OKC', 'away_team': 'BOS', 'season': 2026,
-#  'home_win_prob': 0.69, 'away_win_prob': 0.31, 'predicted_winner': 'OKC',
-#  'confidence': 'high', 'elo_home_prob': 0.77, 'model_accuracy': 0.664}
+#  'home_win_prob': 0.62, 'away_win_prob': 0.38, 'predicted_winner': 'OKC',
+#  'confidence': 'moderate', 'elo_home_prob': 0.77, 'model_accuracy': 0.670}
 ```
 
 - Teams are the **BRef abbreviation of that season**, e.g. `SEA` in 2005 and `OKC` in 2015.
   `available_teams(season)` lists the valid ones.
 - `confidence` is `high` if |p − 0.5| > 0.15, `moderate` if > 0.07, otherwise `low`.
-- `feature_importance()` averages XGBoost gain importance across the calibration folds.
-- `neutral=True` removes home court from the Elo inputs and sets `is_neutral`. **Limitation:**
-  only 207 of ~56k training games are neutral, so XGBoost barely uses `is_neutral` (OKC–BOS
-  moves from 0.686 to 0.680). The Elo-only number reacts properly.
+- `feature_importance()` returns XGBoost's feature importances, sorted.
+- `neutral=True` removes home court from the Elo inputs and sets `is_neutral`. **Known issue:**
+  only 207 of ~56k training games are neutral, mostly near coin-flip 2020 bubble games, so the
+  model **over-reacts** (OKC–BOS drops from 0.62 to 0.50). The app shows a warning, and the
+  Elo-only number is the better guide. This is problem 1 in `ML_NEXT_STEPS.md`.
 
 ---
 
@@ -269,7 +268,7 @@ Keep this test green whenever you add a feature.
 |---|---|---|
 | Accuracy suddenly ~75%+ | A new feature uses post-game info | Add it inside `TeamState.features()`, which only sees prior games, and re-run the leakage test |
 | `ValueError: no data for ['SEA'] in 2015` | Abbreviations change over time | Use `available_teams(season)` |
-| App hangs when the LSTM page loads after a prediction | xgboost and torch ship separate OpenMP runtimes on macOS | Already handled: `torch.set_num_threads(1)` in `player_lstm._load()` |
+| App hangs when the LSTM page loads after a prediction | xgboost and torch ship separate OpenMP runtimes on macOS | Already handled: `torch.set_num_threads(1)` in `player_lstm.load_bundle()` |
 | Metrics look stale after re-running the ETL | The bundle is a snapshot | Retrain; the app reads the pickle, not the DB |
 
 ---

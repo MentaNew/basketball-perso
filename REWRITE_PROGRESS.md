@@ -42,10 +42,10 @@ Status log for the two-axis plan agreed on 2026-10-05. **Read this first when co
 | 6 | `etl/validate.py` (declarative SQL checks) + `tests/test_validate.py` (mutation tests) | ✅ merged into main (930ba5d) |
 | 7 | `ml/features.py` (tidy; `read_*` renames; guaranteed `neutral` column) | ✅ merged into main (930ba5d) |
 | 8 | `ml/game_predictor.py` (ship raw XGBoost, drop calibration) | ✅ merged into main (930ba5d) |
-| 9 | `ml/similarity.py` (light tidy) | ⏳ (branch: refactor/similarity-tidy) |
-| 10 | `ml/player_lstm.py` (keep LSTM, light tidy) | ⏳ |
+| 9 | `ml/similarity.py` (light tidy) | ✅ branch `refactor/similarity-tidy`, retrained model identical |
+| 10 | `ml/player_lstm.py` (keep LSTM, light tidy) | ✅ branch `refactor/lstm-tidy`, retrained metrics identical |
 | 11 | `app/` (stale facts fixed, home-court chart excludes neutral games, neutral-site warning) | ✅ merged into main (930ba5d) |
-| 12 | Tests + docs: update `PHASE1–5` guides, write `ENGINEERING_LEVELS.md` | ⏳ |
+| 12 | Tests + docs: update `PHASE1–5` guides, write `ENGINEERING_LEVELS.md` | ✅ branch `docs/guides-l0` |
 
 ### Module 1 — what was done (2026-10-05)
 
@@ -199,49 +199,4 @@ calibration, LSTM vs Ridge, predictor features, number of archetypes, and an exp
 
 ## The maturity ladder (after L0)
 
-**L1 — Engineered** *(a codebase a team can work on safely)*
-- `pyproject.toml` packaging with console scripts instead of `PYTHONPATH=.`.
-- pydantic-settings for config.
-- `logging` instead of `print`.
-- mypy, plus pre-commit hooks.
-- GitHub Actions CI (lint, types, unit tests, and integration tests on a Postgres service
-  container).
-- Alembic migrations.
-- docker-compose for Postgres, plus a Makefile.
-- pytest markers and coverage.
-- App smoke tests in pytest.
-
-**L2 — Resilient** *(survives the real world)*
-- HTTP timeouts, retries with backoff and jitter, `Retry-After`, and a token-bucket rate
-  limiter.
-- pandera data contracts at the parse boundary.
-- Upserts and incremental in-season updates.
-- An `etl_runs` metadata table and structured JSON logs.
-- The validation gate becomes part of the pipeline.
-- Scheduled runs with alerting.
-- Raw-page lineage (`fetched_at`, sha256).
-- Failure-injection tests.
-
-**L3 — ML in production** *(trustworthy, reproducible, rollback-able models)*
-- MLflow tracking and a model registry (models versioned with data snapshot and git SHA).
-- Reproducible training.
-- CI evaluation gates (must beat Elo / Ridge / last-season).
-- Proper calibration.
-- Training/serving parity tests and model cards.
-- NEXT_STEPS model items (neutral sites, LSTM, predictor features, similarity stability).
-- Prediction logging and drift monitoring.
-
-**L4 — Operated service** *(run it like a product; core FDE skills)*
-- FastAPI prediction service; Streamlit becomes a client of it.
-- Docker images and a cloud deploy with hosted Postgres.
-- Health checks, metrics and tracing (OpenTelemetry).
-- Secrets management, API auth and rate limiting.
-- Load test with an SLO.
-- Runbook and an incident drill.
-- Dependency scanning.
-
-**Optional Phase 6 — AI layer** *(after L1)*
-- A text-to-SQL agent over the DB, with read-only access, guardrails and an eval suite.
-
-The full plan text is in `~/.claude/plans/before-moving-on-to-groovy-shell.md`. Open
-feature and model work, mapped onto these levels, is in `NEXT_STEPS.md`.
+Moved to **`ENGINEERING_LEVELS.md`** (L1 Engineered → L2 Resilient → L3 ML-in-prod → L4 Operated).

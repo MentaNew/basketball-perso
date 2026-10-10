@@ -1,8 +1,18 @@
-"""Player similarity & archetypes: per-season z-scores -> PCA(10) -> KMeans(9); UMAP(2) for viz.
+"""Player similarity and archetypes.
+
+Pipeline (features from ml.features: per-season z-scores, so eras compare fairly):
+
+    14 z-scores --PCA(10)--> denoised space --+--> KMeans(9)      -> clusters -> archetype names
+                                              +--> cosine similarity -> "who plays like X?"
+                                              +--> UMAP(2)        -> the 2-D map in the app
+
+Clustering and similarity use the PCA space, never the UMAP coordinates: UMAP distorts
+distances to make a readable picture.
 
 Usage: python -m ml.similarity train
 """
 import argparse
+from functools import cache
 from pathlib import Path
 
 import joblib
@@ -24,11 +34,12 @@ from ml.features import (
 
 MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "similarity.pkl"
 N_PCA, N_CLUSTERS = 10, 9
+SAME_ERA_SEASONS = 5  # cross_era=False keeps players within this many seasons
 
-# Archetype templates: expected sign/size of the per-season z-score profile.  Clusters are
-# matched one-to-one to the best-fitting templates (Hungarian assignment on cosine
-# similarity), so names follow the centroids rather than arbitrary KMeans ids (§7.6).
-# There are more templates than clusters; the unused ones are simply left out.
+# Archetype templates: the z-score profile each archetype is expected to have. KMeans numbers
+# its clusters arbitrarily, so each cluster gets the name of the template its centroid
+# resembles most (one name per cluster). There are more templates than clusters; the
+# worst-fitting ones simply go unused.
 ARCHETYPE_TEMPLATES = {
     "Franchise Star":     {"pts": 1.8, "usg_pct": 1.6, "per": 1.9, "bpm": 1.7, "ast": 0.6, "reb": 0.5, "ts_pct": 0.6},
     "Traditional Big":   {"reb": 1.5, "blk": 1.2, "fg_pct": 1.2, "fg3a_rate": -1.2, "fg3_pct": -0.8, "ast": -0.5, "ft_pct": -0.6},
@@ -46,56 +57,61 @@ ARCHETYPE_TEMPLATES = {
 }
 
 
+def unit_rows(matrix: np.ndarray) -> np.ndarray:
+    return matrix / np.linalg.norm(matrix, axis=1, keepdims=True)
+
+
 def name_clusters(centroids: pd.DataFrame) -> dict[int, str]:
-    """centroids: (n_clusters x SIMILARITY_COLS) mean z-scores -> {cluster: name}."""
+    """{cluster id: archetype name}, from centroids (clusters x SIMILARITY_COLS mean z-scores).
+
+    Cosine similarity between every centroid and every template, then the Hungarian
+    algorithm picks the one-to-one assignment with the highest total similarity.
+    """
     names = list(ARCHETYPE_TEMPLATES)
-    T = np.array([[ARCHETYPE_TEMPLATES[n].get(c, 0.0) for c in SIMILARITY_COLS] for n in names])
-    C = centroids[SIMILARITY_COLS].to_numpy()
-    sim = (C / np.linalg.norm(C, axis=1, keepdims=True)) @ (
-        T / np.linalg.norm(T, axis=1, keepdims=True)).T
-    rows, cols = linear_sum_assignment(-sim)
-    return {int(centroids.index[r]): names[c] for r, c in zip(rows, cols, strict=True)}
+    templates = np.array([[ARCHETYPE_TEMPLATES[n].get(c, 0.0) for c in SIMILARITY_COLS] for n in names])
+    similarity = unit_rows(centroids[SIMILARITY_COLS].to_numpy()) @ unit_rows(templates).T
+    cluster_rows, template_cols = linear_sum_assignment(-similarity)  # it minimises cost
+    return {int(centroids.index[r]): names[c] for r, c in zip(cluster_rows, template_cols, strict=True)}
 
 
-def train():
-    df = build_similarity_features(min_games=41)
-    X = df[z_cols()].to_numpy()
-    print(f"Player-seasons: {len(df):,} ({df.season.min()}–{df.season.max()})")
+def train() -> dict:
+    seasons = build_similarity_features(min_games=41)
+    print(f"Player-seasons: {len(seasons):,} ({seasons.season.min()}–{seasons.season.max()})")
 
-    pca = PCA(n_components=N_PCA, random_state=42).fit(X)
-    X_pca = pca.transform(X)
+    pca = PCA(n_components=N_PCA, random_state=42).fit(seasons[z_cols()].to_numpy())
+    season_vectors = pca.transform(seasons[z_cols()].to_numpy())
     print(f"PCA explained variance: {pca.explained_variance_ratio_.sum():.1%}")
-    kmeans = KMeans(n_clusters=N_CLUSTERS, n_init=20, random_state=42).fit(X_pca)
-    df["cluster"] = kmeans.labels_
 
-    centroids = df.groupby("cluster")[z_cols()].mean()
+    kmeans = KMeans(n_clusters=N_CLUSTERS, n_init=20, random_state=42).fit(season_vectors)
+    seasons["cluster"] = kmeans.labels_
+    centroids = seasons.groupby("cluster")[z_cols()].mean()
     centroids.columns = SIMILARITY_COLS
     archetypes = name_clusters(centroids)
-    df["archetype"] = df["cluster"].map(archetypes)
+    seasons["archetype"] = seasons["cluster"].map(archetypes)
 
     print("UMAP…")
-    reducer = umap.UMAP(n_components=2, n_neighbors=20, min_dist=0.1, metric="cosine",
-                        random_state=42)
-    emb = reducer.fit_transform(X_pca)
-    df["umap_x"], df["umap_y"] = emb[:, 0], emb[:, 1]
+    reducer = umap.UMAP(n_components=2, n_neighbors=20, min_dist=0.1, metric="cosine", random_state=42)
+    seasons[["umap_x", "umap_y"]] = reducer.fit_transform(season_vectors)
 
-    career = career_profiles(df)
-    career_pca = pca.transform(career[z_cols()].to_numpy())
-    career["cluster"] = kmeans.predict(career_pca)
-    career["archetype"] = career["cluster"].map(archetypes)
+    careers = career_profiles(seasons)
+    career_vectors = pca.transform(careers[z_cols()].to_numpy())
+    careers["cluster"] = kmeans.predict(career_vectors)
+    careers["archetype"] = careers["cluster"].map(archetypes)
 
-    print("\nArchetypes (size · top centroid z-scores):")
-    for k, name in sorted(archetypes.items()):
-        top = centroids.loc[k].sort_values(key=abs, ascending=False).head(4)
-        desc = ", ".join(f"{c} {v:+.1f}" for c, v in top.items())
-        print(f"  {k} {name:<22} n={int((df.cluster == k).sum()):>5}  {desc}")
+    print("\nArchetypes (size · strongest centroid z-scores):")
+    for cluster, name in sorted(archetypes.items()):
+        top = centroids.loc[cluster].sort_values(key=abs, ascending=False).head(4)
+        profile = ", ".join(f"{stat} {z:+.1f}" for stat, z in top.items())
+        print(f"  {cluster} {name:<22} n={int((seasons.cluster == cluster).sum()):>5}  {profile}")
 
-    keep = ["bref_id", "name", "search_name", "season", "team_abr", "team_list", "pos", "age", "g",
-            *RAW_DISPLAY_COLS, *z_cols(), "cluster", "archetype", "umap_x", "umap_y"]
-    keep = list(dict.fromkeys(keep))
+    columns = list(dict.fromkeys(  # dict.fromkeys de-duplicates while keeping order
+        ["bref_id", "name", "search_name", "season", "team_abr", "team_list", "pos", "age", "g",
+         *RAW_DISPLAY_COLS, *z_cols(), "cluster", "archetype", "umap_x", "umap_y"]))
     bundle = {
-        "df": df[keep].reset_index(drop=True), "X_pca": X_pca.astype(np.float32),
-        "career": career, "career_pca": career_pca.astype(np.float32),
+        "df": seasons[columns].reset_index(drop=True),
+        "X_pca": season_vectors.astype(np.float32),
+        "career": careers,
+        "career_pca": career_vectors.astype(np.float32),
         "pca": pca, "kmeans": kmeans, "centroids": centroids,
         "archetype_names": archetypes, "feature_cols": SIMILARITY_COLS,
     }
@@ -107,102 +123,101 @@ def train():
 
 # ---------------------------------------------------------------- inference
 
-_bundle = None
+@cache
+def load_bundle() -> dict:
+    return joblib.load(MODEL_PATH)
 
 
-def _load():
-    global _bundle
-    if _bundle is None:
-        _bundle = joblib.load(MODEL_PATH)
-    return _bundle
-
-
-def _cosine(M: np.ndarray, v: np.ndarray) -> np.ndarray:
-    return (M @ v) / (np.linalg.norm(M, axis=1) * np.linalg.norm(v) + 1e-12)
+def cosine_to(vectors: np.ndarray, target: np.ndarray) -> np.ndarray:
+    return (vectors @ target) / (np.linalg.norm(vectors, axis=1) * np.linalg.norm(target) + 1e-12)
 
 
 def find_similar(player: str, season: int | None = None, top_k: int = 10,
                  cross_era: bool = True, mode: str = "season") -> pd.DataFrame:
-    """Most similar players by cosine similarity in PCA space.
+    """The players most similar to `player` (a name or bref_id), never the player themself.
 
-    mode="season": compare one season (`season`, default the player's latest) against all
-    player-seasons; cross_era=False restricts to ±5 seasons.  mode="career": compare
-    games-weighted career profiles.  Never returns the player themself.
+    mode="season": one of their seasons (default: latest) against every player-season;
+                   each other player appears once, at their best-matching season.
+    mode="career": games-weighted career profiles against each other.
+    cross_era=False keeps only players from within SAME_ERA_SEASONS seasons.
     """
-    b = _load()
     if mode == "career":
-        career = b["career"]
-        bref_id = resolve_player(career, player)
-        if bref_id is None:
-            raise KeyError(player)
-        idx = career.index[career.bref_id == bref_id][0]
-        sims = _cosine(b["career_pca"], b["career_pca"][idx])
-        out = career.assign(similarity=sims)
-        out = out[out.bref_id != bref_id]
-        if not cross_era:
-            mid = (career.at[idx, "first_season"] + career.at[idx, "last_season"]) / 2
-            out = out[((out.first_season + out.last_season) / 2 - mid).abs() <= 5]
-        return out.nlargest(top_k, "similarity")[
-            ["bref_id", "name", "first_season", "last_season", "archetype", "similarity",
-             "pts", "reb", "ast"]].reset_index(drop=True)
+        return _similar_careers(player, top_k, cross_era)
+    return _similar_seasons(player, season, top_k, cross_era)
 
-    df = b["df"]
-    bref_id = resolve_player(df, player)
+
+def _similar_seasons(player: str, season: int | None, top_k: int, cross_era: bool) -> pd.DataFrame:
+    bundle = load_bundle()
+    seasons = bundle["df"]
+    bref_id = resolve_player(seasons, player)
     if bref_id is None:
         raise KeyError(player)
-    rows = df[df.bref_id == bref_id]
-    target = rows[rows.season == season] if season else rows[rows.season == rows.season.max()]
+    own = seasons[seasons.bref_id == bref_id]
+    target = own[own.season == (season or own.season.max())]
     if target.empty:
         raise KeyError(f"{player} has no qualifying season {season}")
-    idx = target.index[0]
-    sims = _cosine(b["X_pca"], b["X_pca"][idx])
-    out = df.assign(similarity=sims)
+    i = target.index[0]
+
+    out = seasons.assign(similarity=cosine_to(bundle["X_pca"], bundle["X_pca"][i]))
     out = out[out.bref_id != bref_id]
     if not cross_era:
-        out = out[(out.season - df.at[idx, "season"]).abs() <= 5]
-    # best season per similar player, so one player doesn't fill the list
+        out = out[(out.season - seasons.at[i, "season"]).abs() <= SAME_ERA_SEASONS]
     out = out.sort_values("similarity", ascending=False).drop_duplicates("bref_id")
-    return out.head(top_k)[
-        ["bref_id", "name", "season", "team_abr", "archetype", "similarity", "pts", "reb", "ast"]
-    ].reset_index(drop=True)
+    return out.head(top_k)[["bref_id", "name", "season", "team_abr", "archetype", "similarity",
+                            "pts", "reb", "ast"]].reset_index(drop=True)
+
+
+def _similar_careers(player: str, top_k: int, cross_era: bool) -> pd.DataFrame:
+    bundle = load_bundle()
+    careers = bundle["career"]
+    bref_id = resolve_player(careers, player)
+    if bref_id is None:
+        raise KeyError(player)
+    i = careers.index[careers.bref_id == bref_id][0]
+
+    out = careers.assign(similarity=cosine_to(bundle["career_pca"], bundle["career_pca"][i]))
+    out = out[out.bref_id != bref_id]
+    if not cross_era:
+        midpoint = (out.first_season + out.last_season) / 2
+        own_midpoint = (careers.at[i, "first_season"] + careers.at[i, "last_season"]) / 2
+        out = out[(midpoint - own_midpoint).abs() <= SAME_ERA_SEASONS]
+    return out.nlargest(top_k, "similarity")[["bref_id", "name", "first_season", "last_season",
+                                              "archetype", "similarity", "pts", "reb", "ast"]
+                                             ].reset_index(drop=True)
 
 
 def get_archetypes() -> pd.DataFrame:
-    b = _load()
-    c = b["centroids"].copy()
-    c.insert(0, "archetype", c.index.map(b["archetype_names"]))
-    c.insert(1, "n", b["df"].cluster.value_counts().reindex(c.index).values)
-    return c.reset_index()
+    """One row per cluster: archetype name, size, and centroid z-scores."""
+    bundle = load_bundle()
+    table = bundle["centroids"].copy()
+    table.insert(0, "archetype", table.index.map(bundle["archetype_names"]))
+    table.insert(1, "n", bundle["df"].cluster.value_counts().reindex(table.index).values)
+    return table.reset_index()
 
 
 def get_player_archetype(player: str, season: int | None = None) -> dict | None:
-    df = _load()["df"]
-    bref_id = resolve_player(df, player)
+    """The archetype of one of a player's seasons (default: latest), or None."""
+    seasons = load_bundle()["df"]
+    bref_id = resolve_player(seasons, player)
     if bref_id is None:
         return None
-    rows = df[df.bref_id == bref_id]
-    rows = rows[rows.season == season] if season else rows[rows.season == rows.season.max()]
-    if rows.empty:
+    own = seasons[seasons.bref_id == bref_id]
+    row = own[own.season == (season or own.season.max())]
+    if row.empty:
         return None
-    r = rows.iloc[0]
-    return {"name": r["name"], "season": int(r.season), "archetype": r.archetype,
-            "cluster": int(r.cluster)}
-
-
-def get_player_archetype_history(player: str) -> pd.DataFrame:
-    df = _load()["df"]
-    bref_id = resolve_player(df, player)
-    return df[df.bref_id == bref_id][["season", "team_abr", "archetype"]]
+    row = row.iloc[0]
+    return {"name": row["name"], "season": int(row.season), "archetype": row.archetype,
+            "cluster": int(row.cluster)}
 
 
 def get_umap_plot_data() -> pd.DataFrame:
-    """Raw (not z-scored) stats for tooltips (§7.6)."""
-    return _load()["df"][["bref_id", "name", "season", "team_abr", "archetype", "umap_x", "umap_y",
-                          *RAW_DISPLAY_COLS]]
+    """2-D map coordinates with raw (not z-scored) stats for tooltips."""
+    return load_bundle()["df"][["bref_id", "name", "season", "team_abr", "archetype",
+                                "umap_x", "umap_y", *RAW_DISPLAY_COLS]]
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["train"])
-    ap.parse_args()
+    parser = argparse.ArgumentParser(description="Train the player similarity model.")
+    parser.add_argument("command", choices=["train"])
+    parser.parse_args()
     train()

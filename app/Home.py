@@ -7,16 +7,20 @@ from app.utils import (
     cached_counts,
     cached_league_averages,
     cached_league_pace,
+    cached_season_range,
     metric_card,
     model_available,
+    season_label,
     style_fig,
 )
 
 st.set_page_config(page_title="NBA Intelligence Platform", page_icon="🏀", layout="wide")
 apply_dark_theme()
 
+first, last = cached_season_range()
 st.title("🏀 NBA Intelligence Platform")
-st.caption("46 seasons of Basketball-Reference data (1979-80 → 2024-25) · PostgreSQL · "
+st.caption(f"{last - first + 1} seasons of Basketball-Reference data "
+           f"({season_label(first)} → {season_label(last)}) · PostgreSQL · "
            "XGBoost · PCA/UMAP/KMeans · LSTM")
 
 counts = cached_counts()
@@ -66,11 +70,12 @@ with c4:
     fig.add_hline(y=0.5, line_dash="dot", line_color="#6b7280")
     fig.update_layout(yaxis_tickformat=".0%", yaxis_title=None, xaxis_title=None)
     st.plotly_chart(style_fig(fig), width="stretch")
-    st.caption("2020 dips to ~50%: the bubble had no home crowds.")
+    st.caption("Neutral-site games (abroad, 2020 bubble) excluded. The edge has shrunk "
+               "from ~65% in the 1980s to ~55% today.")
 
 st.markdown("""
 **Pages** — *Player Profile*: career arcs, archetype, similar players, next-season projection ·
 *Team History*: franchise records across relocations · *Leaders*: any stat, any season ·
-*Game Predictor*: calibrated win probability for any matchup · *Archetype Explorer*: the
-UMAP map of 46 years of player styles.
+*Game Predictor*: win probability for any matchup · *Archetype Explorer*: the
+UMAP map of every season's player styles.
 """)

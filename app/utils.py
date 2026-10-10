@@ -106,8 +106,10 @@ def cached_league_averages() -> pd.DataFrame:
 
 @st.cache_data(ttl=3600)
 def cached_league_pace() -> pd.DataFrame:
+    # home-win rate only where there is a home crowd: neutral sites would understate it
     return query_df("""SELECT season, AVG(home_score + away_score) AS total_pts,
-                              AVG(home_win::int) AS home_win_rate, COUNT(*) AS games
+                              AVG(home_win::int) FILTER (WHERE NOT neutral) AS home_win_rate,
+                              COUNT(*) AS games
                        FROM games WHERE game_type = 'regular' GROUP BY 1 ORDER BY 1""")
 
 
@@ -115,8 +117,7 @@ def cached_league_pace() -> pd.DataFrame:
 def cached_counts() -> dict:
     r = query_df("""SELECT (SELECT COUNT(*) FROM players) players,
                            (SELECT COUNT(*) FROM games) games,
-                           (SELECT COUNT(DISTINCT season) FROM games) seasons,
-                           (SELECT COUNT(DISTINCT franchise_id) FROM team_seasons) franchises""")
+                           (SELECT COUNT(DISTINCT season) FROM games) seasons""")
     return r.iloc[0].to_dict()
 
 

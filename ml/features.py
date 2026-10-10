@@ -1,4 +1,14 @@
-"""Shared feature engineering for all models (training and inference use the same code)."""
+"""Feature engineering shared by all three models.
+
+Training and inference import the same functions, so a feature can never be computed one
+way when training and another way when predicting.
+
+Sections:
+1. Reading from the database
+2. Game features: Elo and team form, computed only from games played *before* each game
+3. Similarity features: per-season z-scores, so players from different eras compare fairly
+4. Career sequences: 4-season windows for the LSTM
+"""
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -9,52 +19,50 @@ from db.connection import query_df
 from etl.parsers import search_name
 from etl.teams import franchise_of
 
-# ---------------------------------------------------------------- loaders
+# ================================================================ 1. reading from the DB
 
 
-def load_player_seasons(min_games: int = 0, primary_only: bool = True) -> pd.DataFrame:
-    """One row per player-season (the TOT row for traded players) with identity columns."""
+def read_player_seasons(min_games: int = 0) -> pd.DataFrame:
+    """One row per player-season (a traded player's combined TOT row), with identity columns."""
     return query_df(
-        f"""SELECT p.bref_id, p.name, p.search_name, p.birth_year, s.*
-            FROM player_seasons s JOIN players p ON p.id = s.player_id
-            WHERE s.g >= :min_games {'AND s.is_primary' if primary_only else ''}
-            ORDER BY p.bref_id, s.season""",
+        """SELECT p.bref_id, p.name, p.search_name, p.birth_year, s.*
+           FROM player_seasons s JOIN players p ON p.id = s.player_id
+           WHERE s.is_primary AND s.g >= :min_games
+           ORDER BY p.bref_id, s.season""",
         {"min_games": min_games},
     )
 
 
-def load_team_seasons() -> pd.DataFrame:
-    return query_df("SELECT * FROM team_seasons ORDER BY season, team_abr")
-
-
-def load_games(types: tuple[str, ...] = ("regular", "play_in", "playoff")) -> pd.DataFrame:
-    df = query_df(
-        "SELECT * FROM games WHERE game_type = ANY(:t) ORDER BY game_date, game_id",
-        {"t": list(types)},
-    )
-    df["game_date"] = pd.to_datetime(df["game_date"])
-    return df
+def read_games(types: tuple[str, ...] = ("regular", "play_in", "playoff")) -> pd.DataFrame:
+    """Games in the order they were played (Cup finals excluded by default)."""
+    games = query_df("SELECT * FROM games WHERE game_type = ANY(:types) ORDER BY game_date, game_id",
+                     {"types": list(types)})
+    games["game_date"] = pd.to_datetime(games["game_date"])
+    return games
 
 
 def resolve_player(df: pd.DataFrame, player: str) -> str | None:
-    """Accept a bref_id or a (case/accent-insensitive) name; return the bref_id.
-    Name collisions resolve to the player with the most seasons in `df`."""
+    """bref_id for a bref_id or a name (any case, accents optional).
+    When two players share a name, picks the one with the most seasons in `df`."""
     if player in set(df["bref_id"]):
         return player
-    hits = df[df["search_name"] == search_name(player)]
-    if hits.empty:
-        return None
-    return hits["bref_id"].value_counts().idxmax()
+    matches = df.loc[df["search_name"] == search_name(player), "bref_id"]
+    return matches.value_counts().idxmax() if not matches.empty else None
 
 
-# ---------------------------------------------------------------- game features
+# ================================================================ 2. game features
 #
-# Everything is computed from games strictly before tip-off (the v1 model used the
-# same season's *final* standings, leaking the result; blueprint §7.2).
+# The rule: a feature for game g may only use games that finished before g started.
+# v1 used each season's *final* standings, which already contain the game's result.
+# Here we walk through the games in date order: read both teams' state (= features),
+# then update the state with the result. Leakage is impossible by construction.
 
-ELO_BASE, ELO_K, ELO_HCA, ELO_CARRY = 1505.0, 20.0, 100.0, 0.75
-PRIOR_GAMES = 10          # season-to-date stats are shrunk toward last season with this weight
-REST_CAP = 7
+ELO_BASE = 1505.0   # rating of an average team
+ELO_K = 20.0        # how fast ratings move
+ELO_HCA = 100.0     # home-court advantage in Elo points (~64% between equal teams)
+ELO_CARRY = 0.75    # between seasons, ratings regress 25% toward the mean
+PRIOR_GAMES = 10    # early-season stats are blended with last season as 10 pseudo-games
+REST_CAP = 7        # days of rest beyond a week don't matter
 
 
 def elo_win_prob(elo_home: float, elo_away: float, hca: float = ELO_HCA) -> float:
@@ -63,47 +71,53 @@ def elo_win_prob(elo_home: float, elo_away: float, hca: float = ELO_HCA) -> floa
 
 def elo_update(elo_home: float, elo_away: float, home_margin: int,
                hca: float = ELO_HCA) -> tuple[float, float]:
-    """FiveThirtyEight-style update with a margin-of-victory multiplier."""
+    """New ratings after a game (FiveThirtyEight-style). Bigger wins move ratings more, but
+    wins the favourite was expected to win big move them less. Zero-sum."""
     p_home = elo_win_prob(elo_home, elo_away, hca)
     home_won = home_margin > 0
-    winner_diff = (elo_home + hca - elo_away) * (1 if home_won else -1)
-    mov_mult = (abs(home_margin) + 3) ** 0.8 / (7.5 + 0.006 * winner_diff)
-    delta = ELO_K * mov_mult * ((1.0 if home_won else 0.0) - p_home)
+    winner_edge = (elo_home + hca - elo_away) * (1 if home_won else -1)
+    margin_multiplier = (abs(home_margin) + 3) ** 0.8 / (7.5 + 0.006 * winner_edge)
+    delta = ELO_K * margin_multiplier * (float(home_won) - p_home)
     return elo_home + delta, elo_away - delta
 
 
 @dataclass
 class TeamState:
+    """Everything known about one franchise at a point in time."""
     elo: float = ELO_BASE
     season: int | None = None
-    gp: int = 0
+    games: int = 0
     wins: int = 0
-    net: float = 0.0                       # cumulative point differential this season
-    last10: deque = field(default_factory=lambda: deque(maxlen=10))  # (win, margin)
-    last_date: pd.Timestamp | None = None
-    prev_w_pct: float = 0.5
+    point_diff: float = 0.0                       # cumulative, this season
+    last10: deque = field(default_factory=lambda: deque(maxlen=10))  # (won, margin) pairs
+    last_game: pd.Timestamp | None = None
+    prev_w_pct: float = 0.5                       # last season's final values
     prev_net: float = 0.0
 
-    def start_season(self, season: int):
-        if self.season is not None and self.gp:
-            self.prev_w_pct, self.prev_net = self.wins / self.gp, self.net / self.gp
+    def start_season(self, season: int) -> None:
         if self.season is not None:
+            if self.games:
+                self.prev_w_pct = self.wins / self.games
+                self.prev_net = self.point_diff / self.games
             self.elo = ELO_CARRY * self.elo + (1 - ELO_CARRY) * ELO_BASE
-        self.season, self.gp, self.wins, self.net = season, 0, 0, 0.0
+        self.season, self.games, self.wins, self.point_diff = season, 0, 0, 0.0
         self.last10.clear()
-        self.last_date = None
+        self.last_game = None
 
-    def features(self, date: pd.Timestamp | None) -> dict:
-        n, k = self.gp, PRIOR_GAMES
-        rest = REST_CAP if self.last_date is None or date is None else min(
-            (date - self.last_date).days, REST_CAP)
-        l10 = list(self.last10)
+    def features(self, today: pd.Timestamp | None) -> dict:
+        """Pre-game features. `today=None` means "no specific game" (rest is then the cap)."""
+        n, k = self.games, PRIOR_GAMES
+        if self.last_game is None or today is None:
+            rest = REST_CAP
+        else:
+            rest = min((today - self.last_game).days, REST_CAP)
+        recent = list(self.last10)
         return {
             "elo": self.elo,
             "w_pct": (self.wins + k * self.prev_w_pct) / (n + k),
-            "net": (self.net + k * self.prev_net) / (n + k),
-            "l10_w_pct": np.mean([w for w, _ in l10]) if l10 else self.prev_w_pct,
-            "l10_net": np.mean([m for _, m in l10]) if l10 else self.prev_net,
+            "net": (self.point_diff + k * self.prev_net) / (n + k),
+            "l10_w_pct": np.mean([won for won, _ in recent]) if recent else self.prev_w_pct,
+            "l10_net": np.mean([margin for _, margin in recent]) if recent else self.prev_net,
             "prev_w_pct": self.prev_w_pct,
             "prev_net": self.prev_net,
             "gp": n,
@@ -111,12 +125,12 @@ class TeamState:
             "b2b": int(rest == 1),
         }
 
-    def record(self, date: pd.Timestamp, margin: int):
-        self.gp += 1
+    def record(self, day: pd.Timestamp, margin: int) -> None:
+        self.games += 1
         self.wins += margin > 0
-        self.net += margin
+        self.point_diff += margin
         self.last10.append((int(margin > 0), margin))
-        self.last_date = date
+        self.last_game = day
 
 
 TEAM_FEATURES = ["elo", "w_pct", "net", "l10_w_pct", "l10_net", "prev_w_pct", "prev_net",
@@ -128,6 +142,7 @@ GAME_FEATURES = (
 
 
 def matchup_features(home: dict, away: dict, is_playoff: bool, neutral: bool = False) -> dict:
+    """One model input row from two teams' feature dicts."""
     row = {f"home_{k}": v for k, v in home.items()} | {f"away_{k}": v for k, v in away.items()}
     row["elo_diff"] = home["elo"] - away["elo"]
     row["net_diff"] = home["net"] - away["net"]
@@ -139,122 +154,130 @@ def matchup_features(home: dict, away: dict, is_playoff: bool, neutral: bool = F
 
 
 def build_game_features(games: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    """Walk games chronologically, emitting pre-game features, then updating state.
+    """Walk the games in date order: emit each game's pre-game features, then update.
 
-    Returns (features DataFrame aligned with `games` + target, end-of-season snapshots
-    {(season, team_abr): team feature dict}) for hypothetical matchups at inference time.
-    Team state is keyed by franchise, so Seattle's history carries into Oklahoma City.
+    Returns:
+      features  - one row per game (aligned with `games`), plus the `target` (home win)
+      snapshots - {(season, team_abr): team features after its last game}, used to predict
+                  hypothetical matchups ("2016 Warriors vs 1996 Bulls")
+    State is kept per franchise, so Seattle's rating carries into Oklahoma City.
     """
     states: dict[str, TeamState] = {}
+    current_abr: dict[str, str] = {}  # franchise -> abbreviation it used most recently
     snapshots: dict[tuple[int, str], dict] = {}
-    last_abr: dict[str, str] = {}
     rows = []
-    current_season = None
 
-    def snapshot_season(season):
-        for fr, st in states.items():
-            if st.season == season:
-                snapshots[(season, last_abr[fr])] = st.features(None) | {"rest": 2, "b2b": 0}
+    def take_snapshots(season: int) -> None:
+        for franchise, state in states.items():
+            if state.season == season:
+                snapshots[(season, current_abr[franchise])] = state.features(None) | {"rest": 2, "b2b": 0}
 
+    season = None
     for g in games.itertuples(index=False):
-        if g.season != current_season:
-            if current_season is not None:
-                snapshot_season(current_season)
-            current_season = g.season
-        hf, af = franchise_of(g.home_team), franchise_of(g.away_team)
-        for fr, abr in ((hf, g.home_team), (af, g.away_team)):
-            st = states.setdefault(fr, TeamState())
-            if st.season != g.season:
-                st.start_season(g.season)
-            last_abr[fr] = abr
-        h, a = states[hf], states[af]
-        flag = getattr(g, "neutral", False)                # may be None/NaN if unflagged
-        neutral = isinstance(flag, (bool, np.bool_)) and bool(flag)
-        rows.append(matchup_features(h.features(g.game_date), a.features(g.game_date),
-                                     g.game_type == "playoff", neutral))
+        if g.season != season:
+            if season is not None:
+                take_snapshots(season)
+            season = g.season
+        home_fr, away_fr = franchise_of(g.home_team), franchise_of(g.away_team)
+        for franchise, abr in ((home_fr, g.home_team), (away_fr, g.away_team)):
+            state = states.setdefault(franchise, TeamState())
+            if state.season != g.season:
+                state.start_season(g.season)
+            current_abr[franchise] = abr
+        home, away = states[home_fr], states[away_fr]
+
+        rows.append(matchup_features(home.features(g.game_date), away.features(g.game_date),
+                                     is_playoff=g.game_type == "playoff", neutral=g.neutral))
         margin = int(g.home_score - g.away_score)
-        h.elo, a.elo = elo_update(h.elo, a.elo, margin, hca=0.0 if neutral else ELO_HCA)
-        h.record(g.game_date, margin)
-        a.record(g.game_date, -margin)
-    if current_season is not None:
-        snapshot_season(current_season)
+        home.elo, away.elo = elo_update(home.elo, away.elo, margin,
+                                        hca=0.0 if g.neutral else ELO_HCA)
+        home.record(g.game_date, margin)
+        away.record(g.game_date, -margin)
+    if season is not None:
+        take_snapshots(season)
 
-    feats = pd.DataFrame(rows, index=games.index)
-    feats["target"] = games["home_win"].astype(int).values
-    return feats, snapshots
+    features = pd.DataFrame(rows, index=games.index)
+    features["target"] = games["home_win"].astype(int).values
+    return features, snapshots
 
 
-# ---------------------------------------------------------------- similarity features
+# ================================================================ 3. similarity features
 
 SIMILARITY_COLS = ["pts", "reb", "ast", "stl", "blk", "tov", "fg_pct", "fg3_pct", "ft_pct",
                    "ts_pct", "usg_pct", "per", "bpm", "fg3a_rate"]
 RAW_DISPLAY_COLS = ["pts", "reb", "ast", "stl", "blk", "fg3_pct", "ts_pct", "per", "bpm"]
 
 
-def build_similarity_features(min_games: int = 41) -> pd.DataFrame:
-    """Per-season z-scores (era adjustment: pace and the 3PT revolution) of SIMILARITY_COLS.
-    z-columns are suffixed `_z`; raw columns are kept for display."""
-    df = load_player_seasons(min_games=min_games)
-    df = df.dropna(subset=["pts", "per"]).reset_index(drop=True)
-    grp = df.groupby("season")
-    for c in SIMILARITY_COLS:
-        z = (df[c] - grp[c].transform("mean")) / (grp[c].transform("std") + 1e-8)
-        df[f"{c}_z"] = z.fillna(0.0)  # e.g. fg3_pct for players with no attempts
-    return df
-
-
 def z_cols() -> list[str]:
     return [f"{c}_z" for c in SIMILARITY_COLS]
 
 
-def career_profiles(season_df: pd.DataFrame) -> pd.DataFrame:
-    """Games-weighted career average of the per-season z-scores (one row per player)."""
-    zc = z_cols()
-    w = season_df["g"]
-    agg = season_df[zc].mul(w, axis=0).groupby(season_df["bref_id"]).sum().div(
-        w.groupby(season_df["bref_id"]).sum(), axis=0)
-    meta = season_df.groupby("bref_id").agg(
+def build_similarity_features(min_games: int = 41) -> pd.DataFrame:
+    """Each stat as a z-score *within its own season*.
+
+    In 1985 one three-pointer a game made you a shooter; in 2025 it makes you a non-shooter.
+    Comparing players by how far they stood from their contemporaries makes eras comparable.
+    Raw columns are kept for display; z-scores get a `_z` suffix.
+    """
+    df = read_player_seasons(min_games=min_games).dropna(subset=["pts", "per"]).reset_index(drop=True)
+    by_season = df.groupby("season")
+    for c in SIMILARITY_COLS:
+        z = (df[c] - by_season[c].transform("mean")) / (by_season[c].transform("std") + 1e-8)
+        df[f"{c}_z"] = z.fillna(0.0)  # e.g. fg3_pct for a player with no attempts: "average"
+    return df
+
+
+def career_profiles(seasons: pd.DataFrame) -> pd.DataFrame:
+    """One row per player: the games-weighted average of their per-season z-scores."""
+    weights = seasons["g"]
+    weighted_sum = seasons[z_cols()].mul(weights, axis=0).groupby(seasons["bref_id"]).sum()
+    profile = weighted_sum.div(weights.groupby(seasons["bref_id"]).sum(), axis=0)
+    info = seasons.groupby("bref_id").agg(
         name=("name", "first"), search_name=("search_name", "first"),
         first_season=("season", "min"), last_season=("season", "max"),
         seasons=("season", "count"),
         **{c: (c, "mean") for c in RAW_DISPLAY_COLS},
     )
-    return meta.join(agg).reset_index()
+    return info.join(profile).reset_index()
 
 
-# ---------------------------------------------------------------- career sequences (LSTM)
+# ================================================================ 4. career sequences (LSTM)
 
-LSTM_STAT_COLS = ["pts", "reb", "ast", "stl", "blk", "fg_pct"]
-LSTM_INPUT_COLS = LSTM_STAT_COLS + ["mp", "g", "age", "gap"]
-SEQ_IN = 4           # seasons of history
-MAX_GAP = 2          # allow one missed season inside the input window
+LSTM_STAT_COLS = ["pts", "reb", "ast", "stl", "blk", "fg_pct"]   # what we predict
+LSTM_INPUT_COLS = LSTM_STAT_COLS + ["mp", "g", "age", "gap"]       # what the model sees
+SEQ_IN = 4    # seasons of history per window
+MAX_GAP = 2   # a window may skip at most one season (gap = 2)
 
 
 def career_table(min_games: int = 20) -> pd.DataFrame:
-    df = load_player_seasons(min_games=min_games)
+    """Qualifying player-seasons in career order, with `gap` = seasons since the previous one."""
+    df = read_player_seasons(min_games=min_games)
     df = df.dropna(subset=LSTM_STAT_COLS + ["mp", "age"]).sort_values(["bref_id", "season"])
     df["gap"] = df.groupby("bref_id")["season"].diff().fillna(1).clip(upper=3)
     return df.reset_index(drop=True)
 
 
-def build_career_sequences(df: pd.DataFrame) -> dict:
-    """Sliding windows: SEQ_IN seasons in (gaps ≤ MAX_GAP, gap is a feature) -> the
-    immediately following season out.  Returned unnormalised; the model normalises."""
+def build_career_sequences(careers: pd.DataFrame) -> dict:
+    """Sliding windows: SEQ_IN seasons in -> the season right after them out.
+
+    A window is kept only if the target season directly follows it (gap == 1) and no gap
+    inside it exceeds MAX_GAP. Returned unnormalised; the model normalises with
+    training-set statistics only.
+    """
     X, y, meta = [], [], []
-    for bref_id, grp in df.groupby("bref_id", sort=False):
-        vals = grp[LSTM_INPUT_COLS].to_numpy(np.float32)
-        targ = grp[LSTM_STAT_COLS].to_numpy(np.float32)
-        seasons = grp["season"].to_numpy()
-        gaps = grp["gap"].to_numpy()
-        for end in range(SEQ_IN, len(grp)):
-            window_gaps = gaps[end - SEQ_IN + 1:end]
-            if gaps[end] != 1 or (window_gaps > MAX_GAP).any():
+    for bref_id, career in careers.groupby("bref_id", sort=False):
+        inputs = career[LSTM_INPUT_COLS].to_numpy(np.float32)
+        targets = career[LSTM_STAT_COLS].to_numpy(np.float32)
+        gaps = career["gap"].to_numpy()
+        for end in range(SEQ_IN, len(career)):  # `end` = index of the target season
+            if gaps[end] != 1 or (gaps[end - SEQ_IN + 1:end] > MAX_GAP).any():
                 continue
-            X.append(vals[end - SEQ_IN:end])
-            y.append(targ[end])
-            meta.append((bref_id, grp["name"].iat[0], int(seasons[end]), float(grp["age"].iat[end])))
-    return {
-        "X": np.stack(X) if X else np.zeros((0, SEQ_IN, len(LSTM_INPUT_COLS)), np.float32),
-        "y": np.stack(y) if y else np.zeros((0, len(LSTM_STAT_COLS)), np.float32),
+            X.append(inputs[end - SEQ_IN:end])
+            y.append(targets[end])
+            meta.append((bref_id, career["name"].iat[0], int(career["season"].iat[end]),
+                         float(career["age"].iat[end])))
+    return {  # reshape keeps the right shape even when a career has no valid window
+        "X": np.array(X, dtype=np.float32).reshape(-1, SEQ_IN, len(LSTM_INPUT_COLS)),
+        "y": np.array(y, dtype=np.float32).reshape(-1, len(LSTM_STAT_COLS)),
         "meta": pd.DataFrame(meta, columns=["bref_id", "name", "target_season", "target_age"]),
     }

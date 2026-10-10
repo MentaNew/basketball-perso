@@ -20,6 +20,7 @@ def toy_games() -> pd.DataFrame:
     df["game_date"] = pd.to_datetime(df["game_date"])
     df["home_win"] = df.home_score > df.away_score
     df["game_type"] = "regular"
+    df["neutral"] = False
     return df
 
 
@@ -95,7 +96,7 @@ def test_archetype_names_follow_centroids():
 
 
 def test_neutral_games_have_no_home_court():
-    games = toy_games().assign(neutral=False)
+    games = toy_games()
     games.loc[0, "neutral"] = True
     feats, _ = F.build_game_features(games)
     assert feats.iloc[0].is_neutral == 1 and feats.iloc[1].is_neutral == 0

@@ -1,8 +1,8 @@
-"""Polite, cached fetching of Basketball-Reference pages.
+"""Download Basketball-Reference pages, politely, with an on-disk cache.
 
-Every page is cached to data/raw/{season}/{page}.html so parsing can be re-run without
-re-scraping.  BRef allows ~20 requests/min and bans offenders for hours, so we sleep
-after every network request.
+Every page is saved to data/raw/{season}/{page}.html, so it is downloaded at most once;
+re-parsing everything later needs no network. BRef allows about 20 requests/min and bans
+clients that go faster for hours, so we sleep after every real request.
 """
 import time
 from pathlib import Path
@@ -14,10 +14,7 @@ from etl import parsers
 
 BASE_URL = "https://www.basketball-reference.com/leagues"
 RAW_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; personal-research)",
-    "Accept-Language": "en-US,en;q=0.9",
-}
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; personal-research)"}
 SLEEP_S = 4.0
 
 
@@ -26,60 +23,63 @@ class RateLimited(RuntimeError):
 
 
 def fetch_page(season: int, page: str, refresh: bool = False, sleep_s: float = SLEEP_S) -> str | None:
-    """Return the HTML of /leagues/NBA_{season}_{page}.html, or None on 404."""
-    cache = RAW_DIR / str(season) / f"{page}.html"
-    missing_marker = cache.with_suffix(".404")
+    """HTML of /leagues/NBA_{season}_{page}.html, or None if BRef has no such page (404).
+
+    A 404 is remembered with an empty `{page}.404` marker file, so it isn't asked again.
+    """
+    cached = RAW_DIR / str(season) / f"{page}.html"
+    missing = cached.with_suffix(".404")
     if not refresh:
-        if cache.exists():
-            return cache.read_text(encoding="utf-8")
-        if missing_marker.exists():
+        if cached.exists():
+            return cached.read_text(encoding="utf-8")
+        if missing.exists():
             return None
 
     url = f"{BASE_URL}/NBA_{season}_{page}.html"
-    resp = requests.get(url, headers=HEADERS, timeout=30)
+    response = requests.get(url, headers=HEADERS, timeout=30)
     time.sleep(sleep_s)
-    if resp.status_code == 429:
+    if response.status_code == 429:
         raise RateLimited(f"429 from {url}: stop and wait before resuming")
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    if resp.status_code == 404:
-        missing_marker.touch()
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    if response.status_code == 404:
+        missing.touch()
         return None
-    resp.raise_for_status()
-    resp.encoding = "utf-8"
-    cache.write_text(resp.text, encoding="utf-8")
-    return resp.text
+    response.raise_for_status()
+    response.encoding = "utf-8"
+    cached.write_text(response.text, encoding="utf-8")
+    return response.text
 
 
-def _require(html: str | None, season: int, page: str) -> str:
+def fetch_required(season: int, page: str, refresh: bool = False) -> str:
+    html = fetch_page(season, page, refresh)
     if html is None:
         raise parsers.TableNotFound(f"page NBA_{season}_{page}.html does not exist")
     return html
 
 
-def get_player_per_game(season: int, refresh: bool = False) -> pd.DataFrame:
-    html = _require(fetch_page(season, "per_game", refresh), season, "per_game")
-    return parsers.parse_player_table(html, "per_game")
-
-
-def get_player_advanced(season: int, refresh: bool = False) -> pd.DataFrame:
-    html = _require(fetch_page(season, "advanced", refresh), season, "advanced")
-    return parsers.parse_player_table(html, "advanced")
+def get_players(season: int, refresh: bool = False) -> pd.DataFrame:
+    """Per-game and advanced stats merged into one wide row per (player, team)."""
+    per_game = parsers.parse_player_table(fetch_required(season, "per_game", refresh), "per_game")
+    advanced = parsers.parse_player_table(fetch_required(season, "advanced", refresh), "advanced")
+    return parsers.merge_player_tables(per_game, advanced)
 
 
 def get_standings(season: int, refresh: bool = False) -> pd.DataFrame:
-    html = _require(fetch_page(season, "standings", refresh), season, "standings")
-    return parsers.parse_standings(html)
+    return parsers.parse_standings(fetch_required(season, "standings", refresh))
 
 
-def get_season_schedule(season: int, refresh: bool = False) -> pd.DataFrame:
-    """All played games of a season.  Month pages are discovered from the season index,
-    which handles lockouts and the 2020 bubble (october-2019 ... october-2020)."""
-    index = _require(fetch_page(season, "games", refresh), season, "games")
+def get_schedule(season: int, refresh: bool = False) -> pd.DataFrame:
+    """Every played game of the season, in date order.
+
+    The season index NBA_{season}_games.html shows the first month and links to the other
+    months, so the first month's own page is never fetched.
+    """
+    index = fetch_required(season, "games", refresh)
     months = parsers.parse_schedule_months(index, season)
-    frames = [parsers.parse_schedule(index, season)]  # index page shows the first month,
-    for slug in months[1:]:                             # so its own page isn't fetched again
+    frames = [parsers.parse_schedule(index, season)]
+    for slug in months[1:]:
         html = fetch_page(season, f"games-{slug}", refresh, sleep_s=5.0)
         if html is not None:
             frames.append(parsers.parse_schedule(html, season))
-    df = pd.concat([f for f in frames if not f.empty], ignore_index=True)
-    return df.drop_duplicates("game_id").sort_values(["game_date", "game_id"], ignore_index=True)
+    games = pd.concat(frames, ignore_index=True)
+    return games.sort_values(["game_date", "game_id"], ignore_index=True)

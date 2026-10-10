@@ -54,6 +54,11 @@ with g1:
 with g2:
     st.plotly_chart(win_gauge(res["away_win_prob"], away if neutral else f"{away} (away)"),
                     width="stretch")
+if neutral:
+    # shortcut: known model issue (NEXT_STEPS #2), remove this warning once it's fixed
+    st.warning("Neutral-site predictions are unreliable: the model learned them from only "
+               "~200 games, mostly the 2020 bubble, and pulls them toward 50%. "
+               "The Elo-only number below is the better guide for now.")
 
 m = st.columns(3)
 with m[0]:

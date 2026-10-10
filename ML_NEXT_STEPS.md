@@ -34,7 +34,7 @@ a model can find an edge. Lines also lean slightly high: unders 50.2% vs overs 4
 **Early finding:** last season's *progression* (wins Y-1 − Y-2) has ~0 correlation (+0.008)
 with what the regressed baseline misses. Test it properly, but expect it to be weak.
 
-### A0 — Data *(branch `data/win-totals-payroll`)*
+### A0 — Data *(branch `data/win-totals-payroll`)*: ✅ done 2026-10-10 (`win_totals` 914 rows, `player_salaries` 16,528, `salary_caps` 33, view `team_payrolls`)
 Raw pages are already downloaded into `data/raw/` (see `DATA.md`). Load them:
 1. `win_totals` table: season, team, line, over/under odds, actual wins. Source:
    `data/raw/odds/win_totals_{season}.html`, seasons 1994–2026 (no 1999: lockout). The

@@ -7,7 +7,7 @@ data is never changed. Needs a fully loaded DATABASE_URL; skipped otherwise.
 import pytest
 from sqlalchemy import text
 
-from etl.pipeline import SEASONS, STEPS
+from etl.pipeline import SEASONS, STEPS, applies
 from etl.validate import run_checks
 
 
@@ -20,7 +20,7 @@ def engine():
             done = conn.execute(text("SELECT COUNT(*) FROM etl_checkpoint")).scalar()
     except Exception:
         pytest.skip("DATABASE_URL is not reachable")
-    if done < len(SEASONS) * len(STEPS):
+    if done < sum(applies(season, step) for season in SEASONS for step in STEPS):
         pytest.skip("DATABASE_URL is not fully loaded (run python -m etl.pipeline)")
     return engine
 

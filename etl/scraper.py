@@ -22,12 +22,11 @@ class RateLimited(RuntimeError):
     pass
 
 
-def fetch_page(season: int, page: str, refresh: bool = False, sleep_s: float = SLEEP_S) -> str | None:
-    """HTML of /leagues/NBA_{season}_{page}.html, or None if BRef has no such page (404).
+def fetch(url: str, cached: Path, refresh: bool = False, sleep_s: float = SLEEP_S) -> str | None:
+    """HTML at `url`, read from / saved to `cached`. None if the server says 404.
 
-    A 404 is remembered with an empty `{page}.404` marker file, so it isn't asked again.
+    A 404 is remembered with an empty `.404` marker file next to the cache, so it isn't asked again.
     """
-    cached = RAW_DIR / str(season) / f"{page}.html"
     missing = cached.with_suffix(".404")
     if not refresh:
         if cached.exists():
@@ -35,7 +34,6 @@ def fetch_page(season: int, page: str, refresh: bool = False, sleep_s: float = S
         if missing.exists():
             return None
 
-    url = f"{BASE_URL}/NBA_{season}_{page}.html"
     response = requests.get(url, headers=HEADERS, timeout=30)
     time.sleep(sleep_s)
     if response.status_code == 429:
@@ -48,6 +46,12 @@ def fetch_page(season: int, page: str, refresh: bool = False, sleep_s: float = S
     response.encoding = "utf-8"
     cached.write_text(response.text, encoding="utf-8")
     return response.text
+
+
+def fetch_page(season: int, page: str, refresh: bool = False, sleep_s: float = SLEEP_S) -> str | None:
+    """A BRef league page: /leagues/NBA_{season}_{page}.html, cached as data/raw/{season}/{page}.html."""
+    return fetch(f"{BASE_URL}/NBA_{season}_{page}.html", RAW_DIR / str(season) / f"{page}.html",
+                 refresh, sleep_s)
 
 
 def fetch_required(season: int, page: str, refresh: bool = False) -> str:
@@ -83,3 +87,34 @@ def get_schedule(season: int, refresh: bool = False) -> pd.DataFrame:
             frames.append(parsers.parse_schedule(html, season))
     games = pd.concat(frames, ignore_index=True)
     return games.sort_values(["game_date", "game_id"], ignore_index=True)
+
+
+# ---------------------------------------------------------------- money: betting lines, payroll, cap
+
+WIN_TOTALS_URL = "https://www.covers.com/sportsoddshistory/nba-win/?y={y1}-{y2}&sa=nba&t=win"
+TEAM_URL = "https://www.basketball-reference.com/teams/{team}/{season}.html"
+CAP_URL = "https://www.basketball-reference.com/contracts/salary-cap-history.html"
+
+
+def get_win_totals(season: int, refresh: bool = False) -> pd.DataFrame:
+    """Preseason win totals by team name (empty for seasons without lines, e.g. 1999)."""
+    html = fetch(WIN_TOTALS_URL.format(y1=season - 1, y2=season),
+                 RAW_DIR / "odds" / f"win_totals_{season}.html", refresh, sleep_s=3.0)  # site asks 3 s
+    return parsers.parse_win_totals(html or "")
+
+
+def get_salaries(season: int, refresh: bool = False) -> tuple[pd.DataFrame, int | None]:
+    """(every team's payroll rows for the season, that season's salary cap).
+
+    The season's teams come from its cached standings page; each team page is ~1 request.
+    """
+    teams = parsers.parse_standings(fetch_required(season, "standings"))["team_abr"]
+    frames = []
+    for team in teams:
+        html = fetch(TEAM_URL.format(team=team, season=season),
+                     RAW_DIR / str(season) / f"team_{team}.html", refresh)
+        if html is None:
+            raise parsers.TableNotFound(f"no team page for {team} {season}")
+        frames.append(parsers.parse_salaries(html).assign(team_abr=team))
+    caps = parsers.parse_salary_caps(fetch(CAP_URL, RAW_DIR / "salary_cap_history.html", refresh) or "")
+    return pd.concat(frames, ignore_index=True), caps.get(season)

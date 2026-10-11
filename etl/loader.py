@@ -12,7 +12,7 @@ from sqlalchemy import Connection, delete, func, select
 from sqlalchemy.dialects.postgresql import insert
 
 from db.connection import get_engine
-from db.models import EtlCheckpoint, Game, Player, PlayerSeason, TeamSeason
+from db.models import EtlCheckpoint, Game, Player, PlayerSalary, PlayerSeason, SalaryCap, TeamSeason, WinTotal
 from etl.parsers import search_name
 from etl.teams import franchise_of
 
@@ -110,6 +110,40 @@ def infer_game_types(games: pd.DataFrame, quota: dict[str, int]) -> list[str]:
         else:
             types.append("playoff")
     return types
+
+
+# ---------------------------------------------------------------- money: betting lines, payroll, cap
+
+# Odds-site team names that differ from BRef's name for the same season.
+TEAM_NAME_ALIASES = {"New Orleans Hornets": "New Orleans/Oklahoma City Hornets"}  # 2006-07 (Katrina)
+
+
+def load_win_totals(df: pd.DataFrame, season: int) -> int:
+    """Replace the season's win totals, mapping team names to abbreviations via the standings."""
+    with get_engine().begin() as conn:
+        names = dict(conn.execute(select(TeamSeason.full_name, TeamSeason.team_abr)
+                                  .where(TeamSeason.season == season)).all())
+        team_abr = df["team_name"].map(lambda n: names.get(n) or names.get(TEAM_NAME_ALIASES.get(n)))
+        if team_abr.isna().any():
+            unknown = df.loc[team_abr.isna(), "team_name"].tolist()
+            raise ValueError(f"unknown team names in {season}: {unknown}")
+        rows = df.drop(columns="team_name").assign(season=season, team_abr=team_abr)
+        conn.execute(delete(WinTotal).where(WinTotal.season == season))
+        rows.to_sql(WinTotal.__tablename__, conn, if_exists="append", index=False)
+    return len(rows)
+
+
+def load_salaries(data: tuple[pd.DataFrame, int | None], season: int) -> int:
+    """Replace the season's player salaries and salary cap (data comes from scraper.get_salaries)."""
+    salaries, cap = data
+    with get_engine().begin() as conn:
+        conn.execute(delete(PlayerSalary).where(PlayerSalary.season == season))
+        conn.execute(delete(SalaryCap).where(SalaryCap.season == season))
+        rows = salaries.assign(season=season)
+        rows.to_sql(PlayerSalary.__tablename__, conn, if_exists="append", index=False)
+        if cap:
+            conn.execute(insert(SalaryCap).values(season=season, cap=cap))
+    return len(salaries)
 
 
 # ---------------------------------------------------------------- checkpoint

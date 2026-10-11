@@ -1,8 +1,8 @@
 """ETL command line: scrape seasons from Basketball-Reference into PostgreSQL.
 
-Each season runs three steps, in this order (game types need the standings' W+L):
+Each season runs these steps, in this order (game types and team names need the standings):
 
-    players -> standings -> schedule
+    players -> standings -> schedule -> win_totals -> salaries      (the last two from 1994)
 
 A step is recorded in the etl_checkpoint table only after it succeeds, so an interrupted
 or failed run simply resumes where it stopped on the next run.
@@ -35,7 +35,14 @@ STEPS = {  # step name -> (download + parse, load); dict order is the run order
     "players": (scraper.get_players, loader.load_players),
     "standings": (scraper.get_standings, loader.load_standings),
     "schedule": (scraper.get_schedule, loader.load_games),
+    "win_totals": (scraper.get_win_totals, loader.load_win_totals),
+    "salaries": (scraper.get_salaries, loader.load_salaries),
 }
+FIRST_SEASON = {"win_totals": 1994, "salaries": 1994}  # no betting-line archive before 1993-94
+
+
+def applies(season: int, step: str) -> bool:
+    return season >= FIRST_SEASON.get(step, SEASONS[0])
 
 
 def run_step(season: int, step: str, refresh: bool) -> int:
@@ -59,7 +66,7 @@ def main() -> int:
     failures = []
 
     for season in seasons:
-        todo = [step for step in steps if (season, step) not in done]
+        todo = [step for step in steps if applies(season, step) and (season, step) not in done]
         if not todo:
             continue
         print(f"── {season - 1}-{str(season)[2:]} ({season})", flush=True)

@@ -10,7 +10,7 @@ roadmap Track A (season wins), so do them **after A0–A1**.
 **Data:** `data/raw/odds/win_totals_{season}.html`: preseason win totals, over/under odds and
 actual wins, 1994–2026 (no 1999 lockout). Loaded into a `win_totals` table in roadmap step A0.
 
-**First results (2026-10-10, 856 full 82-game team-seasons):**
+**First results (2026-10-10, 824 team-seasons from full 82-game seasons that have a line):**
 
 | Finding | Number |
 |---|---|

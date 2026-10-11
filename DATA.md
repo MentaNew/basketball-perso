@@ -28,9 +28,13 @@ The raw cache is the real source of truth. The database can always be rebuilt fr
 | `player_seasons` | 25,349 | 1980–2026 | (player, season, team) | per-game + advanced stats in one wide row. Traded players: one row per team + a `TOT` row; `is_primary` marks the one to analyse |
 | `team_seasons` | 1,314 | 1980–2026 | (team, season) | final standings: W-L, conference/division, PS/G, PA/G, SRS, playoffs, `franchise_id` |
 | `games` | 56,454 | 1980–2026 | `game_id` | every played game: teams, scores, `game_type` (52,848 regular, 3,566 playoff, 37 play-in, 3 Cup finals), `neutral`, remarks |
-| `etl_checkpoint` | 141 | 1980–2026 | (season, step) | which pipeline steps finished |
+| `win_totals` | 914 | 1994–2026 | (season, team) | preseason betting line, over/under odds, actual wins (no 1999; 1995–96 partial: 9 and 15 teams) |
+| `player_salaries` | 16,528 | 1994–2026 | (season, team, player) | payroll per player; a player's multiple contracts with a team are summed |
+| `salary_caps` | 33 | 1994–2026 | season | the league salary cap |
+| `etl_checkpoint` | 207 | 1980–2026 | (season, step) | which pipeline steps finished |
 | `teams` *(view)* | 40 | — | `team_abr` | abbreviation → franchise, name, years used |
 | `franchises` *(view)* | 30 | — | `franchise_id` | current identity of each franchise (SEA → OKC, NJN → BRK …) |
+| `team_payrolls` *(view)* | 975 | 1994–2026 | (season, team) | total payroll, players paid, cap, payroll ÷ cap (0.55×–2.62×) |
 
 ## Raw HTML cache (`data/raw/`)
 
@@ -39,8 +43,9 @@ The raw cache is the real source of truth. The database can always be rebuilt fr
 | `{season}/per_game.html`, `advanced.html` | basketball-reference.com league pages | 1980–2026 | ✅ `player_seasons` |
 | `{season}/standings.html` | BRef standings | 1980–2026 | ✅ `team_seasons` |
 | `{season}/games.html`, `games-{month}.html` | BRef schedule pages (`.404` files mark months that don't exist) | 1980–2026 | ✅ `games` |
-| `{season}/team_{ABR}.html` | BRef team-season pages: **salaries** (in a hidden HTML comment) and roster | 1994–2026 | ❌ roadmap A0 (`team_payrolls`) |
-| `odds/win_totals_{season}.html` | covers.com/sportsoddshistory: preseason win totals with line, odds, actual wins | 1994–2026 (no 1999 lockout; the archive has no lines for an unfinished season, so 2026-27 needs another source) | ❌ roadmap A0 (`win_totals`) |
+| `{season}/team_{ABR}.html` | BRef team-season pages: **salaries** (in a hidden HTML comment) and roster | 1994–2026 | ✅ `player_salaries` |
+| `salary_cap_history.html` | BRef salary-cap history (hidden in a comment) | 1985–2027 | ✅ `salary_caps` |
+| `odds/win_totals_{season}.html` | covers.com/sportsoddshistory: preseason win totals with line, odds, actual wins | 1994–2026 (no 1999 lockout; 1995–96 list only 9 and 15 teams; no lines for an unfinished season, so 2026-27 comes from Kalshi) | ✅ `win_totals` |
 
 Downloading rules: BRef ~20 req/min (we use 4–5 s per request); sportsoddshistory asks for a
 3 s crawl delay. HoopsHype (payrolls, HTTP 402) and 2kratings.com (403) block scripts, so we

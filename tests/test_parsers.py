@@ -127,3 +127,38 @@ def test_last_completed_season():
     from etl.pipeline import last_completed_season
     assert last_completed_season(date(2026, 10, 3)) == 2026
     assert last_completed_season(date(2026, 3, 1)) == 2025
+
+
+def test_win_totals_full_season():
+    df = parsers.parse_win_totals(page("win_totals_2025"))
+    assert len(df) == 30
+    bos = df.set_index("team_name").loc["Boston Celtics"]
+    assert (bos.line, bos.over_odds, bos.under_odds, bos.actual_wins) == (58.5, -105, -115, 61)
+
+
+def test_win_totals_partial_archive_keeps_only_real_lines():
+    df = parsers.parse_win_totals(page("win_totals_1995"))   # 1995: only 9 of 27 teams have a line
+    assert len(df) == 9 and df["line"].notna().all()
+
+
+def test_win_totals_page_without_table_is_empty():
+    assert parsers.parse_win_totals("<html><p>no lines yet</p></html>").empty
+
+
+def test_salaries_from_hidden_table():
+    df = parsers.parse_salaries(page("BOS_1994_team"))       # table sits inside an HTML comment
+    assert len(df) == 15 and df["bref_id"].is_unique
+    parish = df.set_index("bref_id").loc["parisro01"]
+    assert (parish["name"], parish["salary"]) == ("Robert Parish", 4_000_000)
+
+
+def test_salary_caps():
+    caps = parsers.parse_salary_caps(page("salary_cap_history"))
+    assert caps[1994] == 15_175_000 and caps[2026] == 154_647_000
+    assert min(caps) == 1985
+
+
+def test_salaries_sum_a_players_multiple_contracts():
+    df = parsers.parse_salaries(page("HOU_2015_team"))      # Luis Scola is listed twice
+    assert df["bref_id"].is_unique
+    assert df.set_index("bref_id").loc["scolalu01", "salary"] == 6_541_000 + 6_172_538

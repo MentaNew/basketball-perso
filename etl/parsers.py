@@ -7,12 +7,13 @@ Every BRef table cell has a stable `data-stat` attribute, e.g.
 We read cells by that key, never by column position or header text. Headers get renamed
 ("Tm" became "Team"), and position-based reading is how v1 swapped home and away scores.
 """
+import io
 import re
 import unicodedata
 from datetime import date
 
 import pandas as pd
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, Comment, Tag
 
 
 class TableNotFound(ValueError):
@@ -22,7 +23,13 @@ class TableNotFound(ValueError):
 # ---------------------------------------------------------------- helpers
 
 def find_table(html: str, table_id: str) -> Tag:
-    table = BeautifulSoup(html, "lxml").find("table", id=table_id)
+    """The table with this id. BRef hides some tables inside HTML comments (it reveals them
+    with JavaScript): the team pages' "salaries2" and the cap history do this; league pages don't."""
+    soup = BeautifulSoup(html, "lxml")
+    table = soup.find("table", id=table_id)
+    if table is None:
+        for comment in soup.find_all(string=lambda s: isinstance(s, Comment) and f'id="{table_id}"' in s):
+            table = BeautifulSoup(comment, "lxml").find("table", id=table_id)
     if table is None:
         raise TableNotFound(f"table id={table_id!r} not found")
     return table
@@ -233,3 +240,49 @@ def is_neutral_site(remarks: str | None, season: int, game_date: date) -> bool:
     place = match.group(1).strip()          # "England", "CT", "Canada"
     is_us_state = re.fullmatch(r"[A-Z]{2}", place) is not None
     return not is_us_state and place != "Canada"
+
+
+# ---------------------------------------------------------------- money: betting lines, payroll, cap
+
+def parse_win_totals(html: str) -> pd.DataFrame:
+    """Preseason win totals from a sportsoddshistory season page (team *names*, not
+    abbreviations). Empty when the page has no table: seasons without lines (1999 lockout)
+    and seasons still in progress."""
+    try:
+        table = pd.read_html(io.StringIO(html), flavor="lxml")[0]
+    except ValueError:  # pandas raises this when there is no <table>
+        return pd.DataFrame(columns=["team_name", "line", "over_odds", "under_odds", "actual_wins"])
+    lines = pd.DataFrame({
+        "team_name": table["Team"],
+        "line": pd.to_numeric(table["Win Total"], errors="coerce"),
+        "over_odds": pd.to_numeric(table["Over Odds"], errors="coerce").astype("Int64"),
+        "under_odds": pd.to_numeric(table["Under Odds"], errors="coerce").astype("Int64"),
+        "actual_wins": pd.to_numeric(table["Actual Wins"], errors="coerce").astype("Int64"),
+    })
+    return lines.dropna(subset=["line"])  # the 1995 and 1996 archive pages list only some teams
+
+
+def parse_salaries(html: str) -> pd.DataFrame:
+    """Players on a team's payroll from a BRef team-season page: bref_id, name, salary ($).
+
+    A player can appear twice (two contracts, back-to-back 10-day deals, old money still owed):
+    every row is money the team paid, so they are summed into one row per player."""
+    players = []
+    for tr in find_table(html, "salaries2").tbody.find_all("tr"):
+        row = read_row(tr)
+        salary = to_float(row.get("salary", "").lstrip("$"))
+        if row.get("player@id") and salary:
+            players.append({"bref_id": row["player@id"], "name": clean_name(row["player"]),
+                            "salary": int(salary)})
+    return pd.DataFrame(players).groupby(["bref_id", "name"], as_index=False, sort=False)["salary"].sum()
+
+
+def parse_salary_caps(html: str) -> dict[int, int]:
+    """{season: cap in $} from BRef's salary-cap history page."""
+    caps = {}
+    for tr in find_table(html, "salary_cap_history").find_all("tr"):  # no <tbody> on this page
+        row = read_row(tr)
+        season = re.search(r"NBA_(\d{4})", row.get("year_id@href", ""))
+        if season and to_float(row.get("cap", "").lstrip("$")):
+            caps[int(season.group(1))] = int(to_float(row["cap"].lstrip("$")))
+    return caps

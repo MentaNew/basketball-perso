@@ -12,6 +12,7 @@ worse (0.614 vs 0.610), so it is not worth its complexity here.
 Usage: python -m ml.game_predictor train
 """
 import argparse
+from dataclasses import asdict
 from functools import cache
 from pathlib import Path
 
@@ -22,7 +23,8 @@ from sklearn.metrics import accuracy_score, brier_score_loss, log_loss, roc_auc_
 from sklearn.model_selection import TimeSeriesSplit
 from xgboost import XGBClassifier
 
-from ml.features import GAME_FEATURES, build_game_features, matchup_features, read_games
+from ml.experiments import log_run
+from ml.features import DEFAULT_ELO, GAME_FEATURES, build_game_features, matchup_features, read_games
 
 MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "game_predictor.pkl"
 TEST_SEASONS = 2
@@ -48,7 +50,7 @@ def score(y_true, p_home: np.ndarray) -> dict:
 
 def train() -> dict:
     games = read_games()
-    features, snapshots = build_game_features(games)
+    features, snapshots = build_game_features(games, DEFAULT_ELO)
     data = features.assign(season=games["season"].values)
     data = data[data["season"] > data["season"].min()].reset_index(drop=True)  # drop burn-in
 
@@ -91,6 +93,7 @@ def train() -> dict:
         "model": final_model,
         "feature_cols": GAME_FEATURES,
         "snapshots": snapshots,
+        "elo": DEFAULT_ELO,  # inference must rebuild matchups with the same Elo settings
         "cv": cv,
         "test_report": test_report,
         "test_seasons": (int(test_from), int(data["season"].max())),
@@ -98,6 +101,8 @@ def train() -> dict:
     }
     MODEL_PATH.parent.mkdir(exist_ok=True)
     joblib.dump(bundle, MODEL_PATH)
+    log_run("game_predictor", metrics=held_out.to_dict(),
+            params={"elo": asdict(DEFAULT_ELO), "test_seasons": bundle["test_seasons"]})
     print(f"\nSaved {MODEL_PATH}")
     return bundle
 
@@ -129,7 +134,7 @@ def predict_winner(home_team: str, away_team: str, season: int | None = None,
         raise ValueError(f"no data for {missing} in {season}")
 
     row = matchup_features(snapshots[(season, home_team)], snapshots[(season, away_team)],
-                           playoff, neutral)
+                           playoff, neutral, bundle.get("elo", DEFAULT_ELO))  # older bundles: default
     p_home = float(bundle["model"].predict_proba(pd.DataFrame([row])[bundle["feature_cols"]])[0, 1])
     edge = abs(p_home - 0.5)
     return {

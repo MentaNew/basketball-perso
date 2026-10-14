@@ -57,34 +57,41 @@ def resolve_player(df: pd.DataFrame, player: str) -> str | None:
 # Here we walk through the games in date order: read both teams' state (= features),
 # then update the state with the result. Leakage is impossible by construction.
 
-ELO_BASE = 1505.0   # rating of an average team
-ELO_K = 20.0        # how fast ratings move
-ELO_HCA = 100.0     # home-court advantage in Elo points (~64% between equal teams)
-ELO_CARRY = 0.75    # between seasons, ratings regress 25% toward the mean
+@dataclass(frozen=True)
+class EloConfig:
+    """Elo's tunable constants. Roadmap B1 searches over these; the defaults are the
+    FiveThirtyEight-style values the models were built with."""
+    base: float = 1505.0   # rating of an average team
+    k: float = 20.0        # how fast ratings move
+    hca: float = 100.0     # home-court advantage in Elo points (~64% between equal teams)
+    carry: float = 0.75    # between seasons, ratings regress (1 - carry) toward the mean
+
+
+DEFAULT_ELO = EloConfig()
 PRIOR_GAMES = 10    # early-season stats are blended with last season as 10 pseudo-games
 REST_CAP = 7        # days of rest beyond a week don't matter
 
 
-def elo_win_prob(elo_home: float, elo_away: float, hca: float = ELO_HCA) -> float:
+def elo_win_prob(elo_home: float, elo_away: float, hca: float = DEFAULT_ELO.hca) -> float:
     return 1.0 / (1.0 + 10 ** (-(elo_home + hca - elo_away) / 400.0))
 
 
 def elo_update(elo_home: float, elo_away: float, home_margin: int,
-               hca: float = ELO_HCA) -> tuple[float, float]:
+               hca: float = DEFAULT_ELO.hca, k: float = DEFAULT_ELO.k) -> tuple[float, float]:
     """New ratings after a game (FiveThirtyEight-style). Bigger wins move ratings more, but
     wins the favourite was expected to win big move them less. Zero-sum."""
     p_home = elo_win_prob(elo_home, elo_away, hca)
     home_won = home_margin > 0
     winner_edge = (elo_home + hca - elo_away) * (1 if home_won else -1)
     margin_multiplier = (abs(home_margin) + 3) ** 0.8 / (7.5 + 0.006 * winner_edge)
-    delta = ELO_K * margin_multiplier * (float(home_won) - p_home)
+    delta = k * margin_multiplier * (float(home_won) - p_home)
     return elo_home + delta, elo_away - delta
 
 
 @dataclass
 class TeamState:
     """Everything known about one franchise at a point in time."""
-    elo: float = ELO_BASE
+    elo: float = DEFAULT_ELO.base
     season: int | None = None
     games: int = 0
     wins: int = 0
@@ -94,12 +101,12 @@ class TeamState:
     prev_w_pct: float = 0.5                       # last season's final values
     prev_net: float = 0.0
 
-    def start_season(self, season: int) -> None:
+    def start_season(self, season: int, elo: EloConfig = DEFAULT_ELO) -> None:
         if self.season is not None:
             if self.games:
                 self.prev_w_pct = self.wins / self.games
                 self.prev_net = self.point_diff / self.games
-            self.elo = ELO_CARRY * self.elo + (1 - ELO_CARRY) * ELO_BASE
+            self.elo = elo.carry * self.elo + (1 - elo.carry) * elo.base
         self.season, self.games, self.wins, self.point_diff = season, 0, 0, 0.0
         self.last10.clear()
         self.last_game = None
@@ -141,19 +148,20 @@ GAME_FEATURES = (
 )
 
 
-def matchup_features(home: dict, away: dict, is_playoff: bool, neutral: bool = False) -> dict:
+def matchup_features(home: dict, away: dict, is_playoff: bool, neutral: bool = False,
+                     elo: EloConfig = DEFAULT_ELO) -> dict:
     """One model input row from two teams' feature dicts."""
     row = {f"home_{k}": v for k, v in home.items()} | {f"away_{k}": v for k, v in away.items()}
     row["elo_diff"] = home["elo"] - away["elo"]
     row["net_diff"] = home["net"] - away["net"]
     row["w_pct_diff"] = home["w_pct"] - away["w_pct"]
-    row["elo_prob"] = elo_win_prob(home["elo"], away["elo"], hca=0.0 if neutral else ELO_HCA)
+    row["elo_prob"] = elo_win_prob(home["elo"], away["elo"], hca=0.0 if neutral else elo.hca)
     row["is_playoff"] = int(is_playoff)
     row["is_neutral"] = int(neutral)
     return row
 
 
-def build_game_features(games: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+def build_game_features(games: pd.DataFrame, elo: EloConfig = DEFAULT_ELO) -> tuple[pd.DataFrame, dict]:
     """Walk the games in date order: emit each game's pre-game features, then update.
 
     Returns:
@@ -180,17 +188,17 @@ def build_game_features(games: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
             season = g.season
         home_fr, away_fr = franchise_of(g.home_team), franchise_of(g.away_team)
         for franchise, abr in ((home_fr, g.home_team), (away_fr, g.away_team)):
-            state = states.setdefault(franchise, TeamState())
+            state = states.setdefault(franchise, TeamState(elo=elo.base))
             if state.season != g.season:
-                state.start_season(g.season)
+                state.start_season(g.season, elo)
             current_abr[franchise] = abr
         home, away = states[home_fr], states[away_fr]
 
         rows.append(matchup_features(home.features(g.game_date), away.features(g.game_date),
-                                     is_playoff=g.game_type == "playoff", neutral=g.neutral))
+                                     is_playoff=g.game_type == "playoff", neutral=g.neutral, elo=elo))
         margin = int(g.home_score - g.away_score)
         home.elo, away.elo = elo_update(home.elo, away.elo, margin,
-                                        hca=0.0 if g.neutral else ELO_HCA)
+                                        hca=0.0 if g.neutral else elo.hca, k=elo.k)
         home.record(g.game_date, margin)
         away.record(g.game_date, -margin)
     if season is not None:

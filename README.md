@@ -40,6 +40,7 @@ python -m ml.similarity train            # UMAP ≈ 1 min
 python -m ml.player_lstm train
 
 ./run.sh                                 # Streamlit dashboard
+python predictions/make_sheet.py         # blank sheet for your own win predictions (page "My Predictions")
 pytest && ruff check .
 ```
 

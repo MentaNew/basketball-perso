@@ -1,6 +1,7 @@
 """Feature tests that need no database: leakage, Elo, sequences, archetype naming."""
 import numpy as np
 import pandas as pd
+import pytest
 
 from etl.teams import franchise_of
 from ml import features as F
@@ -100,7 +101,7 @@ def test_neutral_games_have_no_home_court():
     games = toy_games()
     games.loc[0, "neutral"] = True
     feats, _ = F.build_game_features(games)
-    assert feats.iloc[0].is_neutral == 1 and feats.iloc[1].is_neutral == 0
+    assert feats.iloc[0].home_court == 0 and feats.iloc[1].home_court == 1
     assert feats.iloc[0].elo_prob == 0.5               # equal ratings, no home edge
     # the update also drops home court: the home winner gains more than with HCA
     with_hca, _ = F.build_game_features(games.assign(neutral=False))
@@ -114,3 +115,11 @@ def test_elo_config_changes_ratings():
     assert faster.iloc[1].home_elo != default.iloc[1].home_elo     # k is really used
     flat, _ = F.build_game_features(games, F.EloConfig(hca=0.0))
     assert flat.iloc[0].elo_prob == 0.5                            # no home edge, equal teams
+
+
+def test_seasonal_hca_from_past_home_win_rate():
+    cfg = F.EloConfig(hca=100.0, hca_window=2)
+    record = {2000: [600, 1000], 2001: [640, 1000]}                     # 62% home wins
+    assert F.seasonal_hca(record, 2002, cfg) == pytest.approx(400 * np.log10(0.62 / 0.38))
+    assert F.seasonal_hca({2001: [3, 3]}, 2002, cfg) == 100.0           # 3 games: too few, fixed value
+    assert F.seasonal_hca(record, 2002, F.EloConfig(hca=80.0)) == 80.0  # window 0: always fixed

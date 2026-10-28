@@ -252,7 +252,8 @@ def career_profiles(seasons: pd.DataFrame) -> pd.DataFrame:
 # ================================================================ 4. career sequences (LSTM)
 
 LSTM_STAT_COLS = ["pts", "reb", "ast", "stl", "blk", "fg_pct"]   # what we predict
-LSTM_INPUT_COLS = LSTM_STAT_COLS + ["mp", "g", "age", "gap"]       # what the model sees
+LSTM_INPUT_COLS = LSTM_STAT_COLS + ["mp", "g", "age", "gap",       # what the model sees
+                                    "ts_pct", "usg_pct", "bpm"]
 SEQ_IN = 4    # seasons of history per window
 MAX_GAP = 2   # a window may skip at most one season (gap = 2)
 
@@ -260,7 +261,7 @@ MAX_GAP = 2   # a window may skip at most one season (gap = 2)
 def career_table(min_games: int = 20) -> pd.DataFrame:
     """Qualifying player-seasons in career order, with `gap` = seasons since the previous one."""
     df = read_player_seasons(min_games=min_games)
-    df = df.dropna(subset=LSTM_STAT_COLS + ["mp", "age"]).sort_values(["bref_id", "season"])
+    df = df.dropna(subset=[c for c in LSTM_INPUT_COLS if c != "gap"]).sort_values(["bref_id", "season"])
     df["gap"] = df.groupby("bref_id")["season"].diff().fillna(1).clip(upper=3)
     return df.reset_index(drop=True)
 

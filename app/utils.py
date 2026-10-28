@@ -189,3 +189,21 @@ def model_available(path_name: str) -> bool:
 
 def season_label(season: int) -> str:
     return f"{season - 1}-{str(season)[2:]}"
+
+
+# ---------------------------------------------------------------- my predictions
+
+def predicted_standings(picks: pd.DataFrame) -> pd.DataFrame:
+    """Rank predicted wins within each conference, like the spreadsheet does.
+
+    picks: team, conference ("East"/"West"), wins (blank = not picked yet), last_w.
+    Ties are broken alphabetically. Seeds 1-6 make the playoffs, 7-10 the play-in.
+    """
+    df = picks.dropna(subset=["wins"]).sort_values(["conference", "wins", "team"],
+                                                    ascending=[True, False, True])
+    df["seed"] = df.groupby("conference").cumcount() + 1
+    df["losses"] = 82 - df["wins"]
+    df["gb"] = df.groupby("conference")["wins"].transform("max") - df["wins"]
+    df["vs_last"] = df["wins"] - df["last_w"]
+    df["status"] = pd.cut(df["seed"], [0, 6, 10, 15], labels=["Playoffs", "Play-in", "Lottery"])
+    return df.reset_index(drop=True)

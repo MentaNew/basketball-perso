@@ -70,6 +70,7 @@ def career_df(seasons, gaps=None):
         "bref_id": "x01", "name": "X", "season": seasons,
         **{c: np.arange(n, dtype=float) + i for i, c in enumerate(F.LSTM_STAT_COLS)},
         "mp": 30.0, "g": 70.0, "age": np.arange(22, 22 + n, dtype=float),
+        "ts_pct": 0.55, "usg_pct": 20.0, "bpm": 1.0,
     })
     df["gap"] = df["season"].diff().fillna(1)
     return df

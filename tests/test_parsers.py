@@ -162,3 +162,8 @@ def test_salaries_sum_a_players_multiple_contracts():
     df = parsers.parse_salaries(page("HOU_2015_team"))      # Luis Scola is listed twice
     assert df["bref_id"].is_unique
     assert df.set_index("bref_id").loc["scolalu01", "salary"] == 6_541_000 + 6_172_538
+
+
+def test_roster_ids_come_from_player_links():
+    ids = parsers.parse_roster(page("OKC_2027_team"))
+    assert len(ids) == 17 and "gilgesh01" in ids and len(set(ids)) == 17

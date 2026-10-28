@@ -7,10 +7,8 @@ on the same scale. The table also holds one row per franchise for the *next* sea
 **The rule for every feature:** it must be known before opening night of `season`. Build it
 from earlier seasons only (see `add_last_season`: shift by one season *within a franchise*).
 
-Status: architecture plus a working skeleton. Everything runs end to end with one feature
-group; the `TODO(A1)`/`TODO(A2)`/`TODO(A3)` stubs are yours to fill (see ML_NEXT_STEPS.md).
-Their tests in tests/test_season_wins.py are marked xfail(strict): when you implement one,
-its test starts passing, pytest flags "XPASS", and you delete the marker.
+Model: Ridge on last season's record and the roster's strength (last season's VORP and BPM
+of the players on this season's roster). See ML_NEXT_STEPS.md for results and ideas.
 
 Usage:
     python -m ml.season_wins train      # fit, compare with baselines, log, save
@@ -29,7 +27,10 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 from db.connection import query_df
+from etl.scraper import get_roster
+from etl.teams import franchise_of
 from ml.experiments import log_run
+from ml.features import read_player_seasons
 
 MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "season_wins.pkl"
 
@@ -75,48 +76,75 @@ def add_last_season(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_progression(df: pd.DataFrame) -> pd.DataFrame:
-    """TODO(A2): `progression` = prev_wins82 - the season before's wins82 (needs add_last_season).
-    Expect it to be weak: early analysis found ~0 correlation with the regressed baseline's error."""
-    raise NotImplementedError
+    """`progression` = last season's wins82 minus the season before's (needs add_last_season)."""
+    df["progression"] = df["prev_wins82"] - df.groupby("franchise_id")["prev_wins82"].shift(1)
+    return df
+
+
+def season_rosters(upcoming: int) -> pd.DataFrame:
+    """(season, franchise_id, bref_id): who is on each team, for every season incl. `upcoming`.
+
+    Completed seasons: each player counts for the team he *started* the season with (first
+    entry of team_list), a proxy for the opening-night roster. Upcoming season: today's roster
+    pages on basketball-reference (fetched once, then cached).
+    shortcut: completed seasons miss players who sat out the whole year (~1% of VORP, mostly
+    known before the season); real opening-night rosters would remove that small leak.
+    """
+    played = read_player_seasons()
+    played["franchise_id"] = played["team_list"].str.split(",").str[0].map(franchise_of)
+    today = [{"season": upcoming, "franchise_id": franchise_of(team), "bref_id": bref_id}
+             for team in query_df("SELECT current_abr FROM franchises")["current_abr"]
+             for bref_id in get_roster(upcoming, team)]
+    return pd.concat([played[["season", "franchise_id", "bref_id"]], pd.DataFrame(today)], ignore_index=True)
 
 
 def add_roster_strength(df: pd.DataFrame) -> pd.DataFrame:
-    """TODO(A2): roster strength from player data (`ml.features.read_player_seasons`).
+    """How good this season's roster was over the two previous seasons (all known in October).
+    See `team_strength` for the three features it adds."""
+    stats = read_player_seasons()[["bref_id", "season", "vorp", "bpm", "mp_total", "age"]]
+    last = stats.assign(season=stats["season"] + 1)                       # Y-1 describes season Y
+    before = stats.drop(columns="age").assign(season=stats["season"] + 2)  # Y-2
+    roster = (season_rosters(int(df["season"].max()))
+              .merge(last, on=["bref_id", "season"], how="left")
+              .merge(before, on=["bref_id", "season"], how="left", suffixes=("", "_2")))
+    return df.merge(team_strength(roster), on=["season", "franchise_id"], how="left")
 
-    For each (season Y, team): take the players whose *first* team in Y is this team (the first
-    entry of team_list on TOT rows), and sum their Y-1 BPM (also try WS/48 and VORP), weighted
-    by their Y-1 minutes (mp_total). Never use season-Y stats or minutes: they aren't known
-    before opening night. Rookies have no Y-1 row: count them as replacement level (BPM -2)
-    or ignore them, and test both.
+
+def team_strength(roster: pd.DataFrame) -> pd.DataFrame:
+    """Per (season, franchise_id), from one row per rostered player with his stats one season
+    back (vorp, bpm, mp_total, age) and two seasons back (vorp_2, bpm_2, mp_total_2):
+
+    roster_vorp: sum of VORP, Marcel-style: last season weighs 2, the one before 1
+                 (backtest 2005-24: 6.85 MAE vs 7.02 with last season only).
+    roster_bpm:  BPM over the same two seasons, weighted by minutes x (2 or 1); rookies weigh 0
+                 (backtest: 6.81 vs 6.84 with last season only).
+    roster_age:  age this season, weighted by last season's minutes.
     """
-    raise NotImplementedError
-
-
-def add_continuity(df: pd.DataFrame) -> pd.DataFrame:
-    """TODO(A2): share of the team's Y-1 minutes played by players still on the roster in Y."""
-    raise NotImplementedError
-
-
-def add_age(df: pd.DataFrame) -> pd.DataFrame:
-    """TODO(A2): minutes-weighted age of the season-Y roster (age in Y, minutes from Y-1)."""
-    raise NotImplementedError
+    marcel = (2 * roster["vorp"].fillna(0) + roster["vorp_2"]) / 3
+    vorp = roster["vorp"].where(roster["vorp_2"].isna(), marcel)
+    minutes, minutes_2 = roster["mp_total"].fillna(0), roster["mp_total_2"].fillna(0)
+    parts = roster[["season", "franchise_id"]].assign(
+        vorp=vorp,
+        bpm_x_w=2 * minutes * roster["bpm"].fillna(0) + minutes_2 * roster["bpm_2"].fillna(0),
+        bpm_w=2 * minutes + minutes_2,
+        age_x_min=(roster["age"] + 1) * minutes,
+        min=minutes)
+    team = parts.groupby(["season", "franchise_id"]).sum(min_count=1).reset_index()
+    return pd.DataFrame({"season": team["season"], "franchise_id": team["franchise_id"],
+                         "roster_vorp": team["vorp"], "roster_bpm": team["bpm_x_w"] / team["bpm_w"],
+                         "roster_age": team["age_x_min"] / team["min"]})
 
 
 def add_payroll(df: pd.DataFrame) -> pd.DataFrame:
-    """TODO(A2): financial flexibility. Careful: `payroll_to_cap` is the *full-season* payroll,
-    including mid-season trades, so using season Y's value leaks. Start with the lagged value
-    (Y-1) and a luxury-tax flag; only use season Y if you can justify it's known in October."""
-    raise NotImplementedError
+    """Last season's payroll / cap (this season's full-year payroll would leak mid-season trades).
+    Not in FEATURES: it added only noise on validation (6.67 -> 6.64 MAE on 90 rows)."""
+    df["prev_payroll_to_cap"] = df.groupby("franchise_id")["payroll_to_cap"].shift(1)
+    return df
 
 
-def add_elo(df: pd.DataFrame) -> pd.DataFrame:
-    """TODO(A2): the franchise's end-of-previous-season Elo (`ml.features.build_game_features`
-    returns end-of-season `snapshots` keyed by (season, team_abr))."""
-    raise NotImplementedError
-
-
-FEATURE_BUILDERS: list[Callable[[pd.DataFrame], pd.DataFrame]] = [add_last_season]  # add yours as they work
-FEATURES = ["prev_wins82", "prev_net"]                                              # columns the model sees
+FEATURE_BUILDERS: list[Callable[[pd.DataFrame], pd.DataFrame]] = [
+    add_last_season, add_progression, add_roster_strength, add_payroll]
+FEATURES = ["prev_wins82", "prev_net", "roster_vorp", "roster_bpm", "roster_age"]
 
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -134,19 +162,18 @@ def baseline_always_41(df: pd.DataFrame) -> pd.Series:
 
 
 def baseline_last_season(df: pd.DataFrame) -> pd.Series:
-    """TODO(A1): same as last season (prev_wins82)."""
-    raise NotImplementedError
+    """Same as last season."""
+    return df["prev_wins82"]
 
 
 def baseline_regressed(df: pd.DataFrame, keep: float = 0.7) -> pd.Series:
-    """TODO(A1): last season pulled toward 41: 41 + keep * (prev_wins82 - 41).
-    Early analysis: keep=0.7 gave MAE 7.66 over 1990-2026."""
-    raise NotImplementedError
+    """Last season pulled toward 41: 41 + keep * (prev_wins82 - 41). keep=0.7: MAE 7.66 (1990-2026)."""
+    return 41 + keep * (df["prev_wins82"] - 41)
 
 
 def baseline_vegas(df: pd.DataFrame) -> pd.Series:
-    """TODO(A1): the preseason betting line (vegas_line). The benchmark to chase: MAE 6.67."""
-    raise NotImplementedError
+    """The preseason betting line: the benchmark to chase (MAE 6.67 over 1994-2026)."""
+    return df["vegas_line"]
 
 
 BASELINES = {"always_41": baseline_always_41, "last_season": baseline_last_season,
@@ -182,10 +209,26 @@ def evaluate(df: pd.DataFrame, predictions: dict[str, pd.Series]) -> pd.DataFram
     return pd.DataFrame(rows)
 
 
-# ================================================================ model (A3)
+def backtest(table: pd.DataFrame, features: list[str], seasons=range(2005, 2025)) -> float:
+    """Rolling-origin MAE: for each season, train on all earlier seasons, predict it. ~500
+    predictions instead of the ~90 in `val`, so use this to decide whether a feature helps.
+    Scored on full seasons that have a Vegas line (the same rows Vegas is judged on)."""
+    errors = []
+    for season in seasons:
+        if season in SHORT_SEASONS:
+            continue
+        fit = table[(table["season"] < season) & table["wins82"].notna()].dropna(subset=features)
+        test = table[(table["season"] == season) & table["vegas_line"].notna()]
+        test = test.dropna(subset=[*features, "wins82"])
+        model = make_model().fit(fit[features], fit["wins82"])
+        errors.extend(np.abs(model.predict(test[features]) - test["wins82"]))
+    return float(np.mean(errors))
+
+
+# ================================================================ model
 
 def make_model():
-    """TODO(A3): Ridge is the right start for ~900 rows; try others only if they beat it on val."""
+    """Ridge: with ~900 training rows it beat gradient boosting on validation (6.67 vs 6.73 MAE)."""
     return make_pipeline(StandardScaler(), Ridge(alpha=1.0))
 
 
@@ -199,10 +242,7 @@ def train() -> pd.DataFrame:
     usable = table[FEATURES].notna().all(axis=1)
     predictions["model"][usable] = model.predict(table.loc[usable, FEATURES])
     for name, baseline in BASELINES.items():
-        try:
-            predictions[name] = baseline(table)
-        except NotImplementedError:
-            print(f"  (baseline '{name}' not implemented yet: TODO(A1))")
+        predictions[name] = baseline(table)
 
     report = evaluate(table, predictions)
     print(report.pivot(index="model", columns="split", values="mae").round(2).to_string())

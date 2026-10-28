@@ -29,7 +29,7 @@ def test_features_use_only_past_games():
     feats, _ = F.build_game_features(games)
     # first game: nobody has played; everything is the prior
     first = feats.iloc[0]
-    assert first.home_gp == 0 and first.home_elo == F.ELO_BASE and first.elo_diff == 0
+    assert first.home_gp == 0 and first.home_elo == F.DEFAULT_ELO.base and first.elo_diff == 0
     # changing a game's result must not change that game's own features (no leakage)
     flipped = games.copy()
     flipped.loc[2, ["away_score", "home_score", "home_win"]] = [130, 80, False]
@@ -45,7 +45,8 @@ def test_season_rollover_and_relocation():
     g = feats.iloc[3]                                 # 2002 opener, SEA at home
     assert g.home_gp == 0 and g.home_prev_w_pct == 2 / 3
     end_2001 = snaps[(2001, "SEA")]["elo"]
-    assert np.isclose(g.home_elo, F.ELO_CARRY * end_2001 + (1 - F.ELO_CARRY) * F.ELO_BASE)
+    elo = F.DEFAULT_ELO
+    assert np.isclose(g.home_elo, elo.carry * end_2001 + (1 - elo.carry) * elo.base)
     assert feats.iloc[4].away_gp == 1                 # OKC continues SEA's 2002 season
     assert franchise_of("SEA") == "OKC"
     assert (2001, "SEA") in snaps and (2002, "OKC") in snaps
@@ -104,3 +105,12 @@ def test_neutral_games_have_no_home_court():
     # the update also drops home court: the home winner gains more than with HCA
     with_hca, _ = F.build_game_features(games.assign(neutral=False))
     assert feats.iloc[1].away_elo > with_hca.iloc[1].away_elo   # SEA won game 0 at "home"
+
+
+def test_elo_config_changes_ratings():
+    games = toy_games()
+    default, _ = F.build_game_features(games)
+    faster, _ = F.build_game_features(games, F.EloConfig(k=40.0))
+    assert faster.iloc[1].home_elo != default.iloc[1].home_elo     # k is really used
+    flat, _ = F.build_game_features(games, F.EloConfig(hca=0.0))
+    assert flat.iloc[0].elo_prob == 0.5                            # no home edge, equal teams

@@ -20,6 +20,7 @@ import torch
 from sklearn.linear_model import Ridge
 from torch import nn
 
+from ml.experiments import log_run
 from ml.features import (
     LSTM_INPUT_COLS,
     LSTM_STAT_COLS,
@@ -182,6 +183,9 @@ def train() -> pd.DataFrame:
         "best_val_loss": best_val_loss, "test_report": report,
         "hparams": {"hidden_dim": HIDDEN_DIM, "n_layers": N_LAYERS, "dropout": DROPOUT},
     }, META_PATH)
+    log_run("player_lstm", metrics={"best_val_loss": best_val_loss,
+                                    **report["mean_norm_mae"].add_prefix("test_norm_mae_").to_dict()},
+            params={"hidden_dim": HIDDEN_DIM, "n_layers": N_LAYERS, "dropout": DROPOUT})
     print(f"\nSaved {WEIGHTS_PATH} and {META_PATH}")
     return report
 

@@ -11,6 +11,23 @@ Three tracks, in priority order. Each track is a sequence of feature branches
 
 ---
 
+## Code architecture (where your work goes)
+
+| Track | Module | State | Your entry points |
+|---|---|---|---|
+| A season wins | `ml/season_wins.py` | **walking skeleton**: data → features → Ridge → baselines → log → model → next-season projections all run today (val MAE 7.80 with 2 features) | `TODO(A1)` baselines, `TODO(A2)` feature builders (add each to `FEATURE_BUILDERS` and its columns to `FEATURES`), `TODO(A3)` `make_model()` |
+| B game model | `ml/features.py`, `ml/game_predictor.py` | Elo settings are an `EloConfig`; `build_game_features(games, elo)` and the model bundle carry it | B1: search `EloConfig(k=…, hca=…, carry=…)` by Elo-only log-loss; B2–B5 extend `matchup_features` / `train()` |
+| C player models | `ml/player_lstm.py`, `ml/similarity.py` | unchanged | C1 inputs in `ml/features.py` §4; C2 in `similarity.train()` |
+| X experiment log | `ml/experiments.py` | done: game model, LSTM and season wins append to `models/metrics.jsonl` | `read_runs()` in a notebook to compare runs |
+
+Commands: `python -m ml.season_wins train` · `python -m ml.season_wins predict` · `pytest -q -rx`
+
+**TODO tests:** `tests/test_season_wins.py` holds `xfail(strict=True)` tests that define each stub's
+contract. When you implement one, its test reports **XPASS(strict)** and fails: delete the
+marker, and from then on the test protects your code.
+
+---
+
 ## Track A — Predict next season's team records *(highest priority)*
 
 **Goal:** before a season starts, predict each team's wins, and beat simple rules first, then

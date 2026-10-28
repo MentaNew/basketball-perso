@@ -118,3 +118,12 @@ def get_salaries(season: int, refresh: bool = False) -> tuple[pd.DataFrame, int 
         frames.append(parsers.parse_salaries(html).assign(team_abr=team))
     caps = parsers.parse_salary_caps(fetch(CAP_URL, RAW_DIR / "salary_cap_history.html", refresh) or "")
     return pd.concat(frames, ignore_index=True), caps.get(season)
+
+
+def get_roster(season: int, team: str, refresh: bool = False) -> list[str]:
+    """Players on a team's roster page (for an unfinished season: today's roster)."""
+    html = fetch(TEAM_URL.format(team=team, season=season),
+                 RAW_DIR / str(season) / f"team_{team}.html", refresh)
+    if html is None:
+        raise parsers.TableNotFound(f"no team page for {team} {season}")
+    return parsers.parse_roster(html)

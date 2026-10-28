@@ -1,16 +1,9 @@
-"""Season-wins architecture (roadmap Track A) on a toy table: no database needed.
-
-Tests marked xfail(strict=True) are your TODO list: they define what each stub must do. When
-you implement one, pytest reports "XPASS(strict)" as a failure; that's your cue to delete
-the marker so the test guards your code from then on.
-"""
+"""Season-wins model (roadmap Track A) on a toy table: no database needed."""
 import numpy as np
 import pandas as pd
 import pytest
 
 from ml import season_wins as SW
-
-todo = pytest.mark.xfail(raises=NotImplementedError, strict=True, reason="TODO: implement the stub")
 
 
 def toy_table() -> pd.DataFrame:
@@ -71,28 +64,40 @@ def test_evaluate_skips_short_seasons(monkeypatch):
     assert report.query("split == 'train'")["n"].iat[0] == 4   # 6 known rows minus two in 2009
 
 
-# ---------------------------------------------------------------- your TODOs (A1, A2)
+# ---------------------------------------------------------------- baselines and features
 
-@todo
 def test_baseline_last_season():
     df = SW.add_last_season(toy_table())
     assert by_key(df.assign(p=SW.baseline_last_season(df)), "p")[(2009, "OKC")] == 20.0
 
 
-@todo
 def test_baseline_regressed():
     df = SW.add_last_season(toy_table())
     p = by_key(df.assign(p=SW.baseline_regressed(df, keep=0.5)), "p")
     assert p[(2009, "OKC")] == pytest.approx(41 + 0.5 * (20 - 41))
 
 
-@todo
 def test_baseline_vegas():
     df = toy_table()
     assert by_key(df.assign(p=SW.baseline_vegas(df)), "p")[(2008, "SEA")] == 29.5
 
 
-@todo
 def test_progression():
     df = SW.add_progression(SW.add_last_season(toy_table()))
     assert by_key(df, "progression")[(2009, "OKC")] == pytest.approx(20.0 - 31.0)
+
+
+def test_team_strength_marcel_weights_and_minutes():
+    roster = pd.DataFrame({
+        "season": 2011, "franchise_id": "OKC",
+        "bref_id": ["star", "vet", "rookie"],
+        "vorp": [6.0, 1.0, np.nan], "vorp_2": [3.0, np.nan, np.nan],      # rookie: no history
+        "bpm": [5.0, -1.0, np.nan], "bpm_2": [2.0, np.nan, np.nan],
+        "mp_total": [2000.0, 1000.0, np.nan], "mp_total_2": [1000.0, np.nan, np.nan],
+        "age": [25.0, 33.0, np.nan],
+    })
+    s = SW.team_strength(roster).iloc[0]
+    assert s.roster_vorp == pytest.approx((2 * 6 + 3) / 3 + 1)   # star: Marcel; vet: one season
+    weighted = 2 * 2000 * 5 + 1000 * 2 + 2 * 1000 * -1
+    assert s.roster_bpm == pytest.approx(weighted / (2 * 2000 + 1000 + 2 * 1000))
+    assert s.roster_age == pytest.approx((26 * 2000 + 34 * 1000) / 3000)  # age next season, by minutes

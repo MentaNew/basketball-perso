@@ -286,3 +286,13 @@ def parse_salary_caps(html: str) -> dict[int, int]:
         if season and to_float(row.get("cap", "").lstrip("$")):
             caps[int(season.group(1))] = int(to_float(row["cap"].lstrip("$")))
     return caps
+
+
+def parse_roster(html: str) -> list[str]:
+    """bref_ids on a BRef team-season page's roster (current season: the roster as of today)."""
+    ids = []
+    for tr in find_table(html, "roster").tbody.find_all("tr"):
+        match = re.search(r"/players/\w/(\w+)\.html", read_row(tr).get("player@href", ""))
+        if match:
+            ids.append(match.group(1))
+    return ids

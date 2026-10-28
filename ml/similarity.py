@@ -33,7 +33,7 @@ from ml.features import (
 )
 
 MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "similarity.pkl"
-N_PCA, N_CLUSTERS = 10, 9
+N_PCA, N_CLUSTERS = 10, 8  # k=8: same clusters across seeds (ARI 0.97); k=9 was unstable (0.73)
 SAME_ERA_SEASONS = 5  # cross_era=False keeps players within this many seasons
 
 # Archetype templates: the z-score profile each archetype is expected to have. KMeans numbers
@@ -54,6 +54,9 @@ ARCHETYPE_TEMPLATES = {
     "Energy Big":         {"reb": 0.9, "blk": 0.6, "fg_pct": 0.6, "pts": -0.6, "usg_pct": -0.8, "ft_pct": -0.5},
     "Bench Shooter":      {"fg3a_rate": 0.8, "pts": -0.6, "usg_pct": -0.4, "per": -0.6, "bpm": -0.5},
     "Low-Usage Role Player": {"pts": -0.8, "usg_pct": -0.8, "per": -0.8, "bpm": -0.8, "ts_pct": -0.5},
+    # added after inspecting the k=8 clusters (guards with poor efficiency; low-usage bigs)
+    "Inefficient Guard":  {"ts_pct": -1.4, "fg_pct": -1.2, "per": -1.2, "bpm": -1.1, "reb": -0.8, "pts": -0.8},
+    "Low-Usage Big":      {"ft_pct": -0.9, "fg3a_rate": -0.7, "fg3_pct": -0.6, "usg_pct": -0.7, "ast": -0.7, "fg_pct": 0.2},
 }
 
 

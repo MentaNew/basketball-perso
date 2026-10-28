@@ -35,7 +35,7 @@ MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 WEIGHTS_PATH = MODELS_DIR / "player_lstm.pt"
 META_PATH = MODELS_DIR / "player_lstm_meta.pkl"
 
-HIDDEN_DIM, N_LAYERS, DROPOUT = 128, 2, 0.3
+HIDDEN_DIM, N_LAYERS, DROPOUT = 64, 1, 0.3   # val sweep: beat 128x2 (0.3493 vs 0.3526 normalised MAE)
 LR, WEIGHT_DECAY, EPOCHS, BATCH_SIZE, PATIENCE = 1e-3, 1e-5, 80, 64, 15
 TRAIN_MAX_SEASON, VAL_MAX_SEASON = 2016, 2020
 STAT_IDX = [LSTM_INPUT_COLS.index(c) for c in LSTM_STAT_COLS]  # where the targets sit in the inputs
@@ -162,17 +162,24 @@ def train() -> pd.DataFrame:
     model, best_val_loss = fit_lstm(norm.x(X[train_rows]), norm.y(y[train_rows]),
                                     norm.x(X[val_rows]), norm.y(y[val_rows]), device)
 
-    with torch.no_grad():
-        lstm_test = model(torch.tensor(norm.x(X[test_rows]), dtype=torch.float32, device=device))
+    def lstm_predict(rows):
+        with torch.no_grad():
+            out = model(torch.tensor(norm.x(X[rows]), dtype=torch.float32, device=device))
+        return norm.y_back(out.cpu().numpy())
+
     flat = lambda rows: norm.x(X[rows]).reshape(rows.sum(), -1)  # noqa: E731  (window -> 1 row)
     ridge = Ridge(alpha=1.0).fit(flat(train_rows), y[train_rows])
-    report = mae_table(y[test_rows], {
-        "lstm": norm.y_back(lstm_test.cpu().numpy()),
-        "ridge": ridge.predict(flat(test_rows)),
-        "weighted_avg": baseline_weighted(X[test_rows]),
-        "last_season": baseline_last_season(X[test_rows]),
-    })
-    print(f"\nTest MAE in real units (target seasons > {VAL_MAX_SEASON}):")
+
+    def predictions(rows):
+        lstm, linear = lstm_predict(rows), ridge.predict(flat(rows))
+        return {"lstm": lstm, "ridge": linear, "blend": (lstm + linear) / 2,
+                "weighted_avg": baseline_weighted(X[rows]), "last_season": baseline_last_season(X[rows])}
+
+    # serve whichever model is best on the validation seasons; the test seasons only report
+    candidates = ["lstm", "ridge", "blend"]
+    served = mae_table(y[val_rows], predictions(val_rows)).loc[candidates, "mean_norm_mae"].idxmin()
+    report = mae_table(y[test_rows], predictions(test_rows))
+    print(f"\nTest MAE in real units (target seasons > {VAL_MAX_SEASON}). Served model: {served}")
     print(report.round(4).to_string())
 
     MODELS_DIR.mkdir(exist_ok=True)
@@ -180,12 +187,13 @@ def train() -> pd.DataFrame:
     joblib.dump({
         "input_cols": LSTM_INPUT_COLS, "stat_cols": LSTM_STAT_COLS,
         "x_mean": norm.x_mean, "x_std": norm.x_std, "y_mean": norm.y_mean, "y_std": norm.y_std,
-        "best_val_loss": best_val_loss, "test_report": report,
+        "best_val_loss": best_val_loss, "test_report": report, "served": served, "ridge": ridge,
         "hparams": {"hidden_dim": HIDDEN_DIM, "n_layers": N_LAYERS, "dropout": DROPOUT},
     }, META_PATH)
     log_run("player_lstm", metrics={"best_val_loss": best_val_loss,
                                     **report["mean_norm_mae"].add_prefix("test_norm_mae_").to_dict()},
-            params={"hidden_dim": HIDDEN_DIM, "n_layers": N_LAYERS, "dropout": DROPOUT})
+            params={"hidden_dim": HIDDEN_DIM, "n_layers": N_LAYERS, "dropout": DROPOUT,
+                    "inputs": LSTM_INPUT_COLS, "served": served})
     print(f"\nSaved {WEIGHTS_PATH} and {META_PATH}")
     return report
 
@@ -217,15 +225,17 @@ def predict_next_season(player: str) -> dict | None:
     if len(history) < SEQ_IN or (history["gap"].iloc[1:] > MAX_GAP).any():
         return None
 
-    window = history[meta["input_cols"]].to_numpy(np.float32)[None]
+    window = (history[meta["input_cols"]].to_numpy(np.float32)[None] - meta["x_mean"]) / meta["x_std"]
     with torch.no_grad():
-        prediction = model(torch.tensor((window - meta["x_mean"]) / meta["x_std"])).numpy()[0]
-    prediction = prediction * meta["y_std"] + meta["y_mean"]
+        lstm = model(torch.tensor(window, dtype=torch.float32)).numpy()[0] * meta["y_std"] + meta["y_mean"]
+    linear = meta["ridge"].predict(window.reshape(1, -1))[0]
+    prediction = {"lstm": lstm, "ridge": linear, "blend": (lstm + linear) / 2}[meta.get("served", "lstm")]
     return {
         "player": history["name"].iat[0],
         "based_on_seasons": history["season"].tolist(),
         "target_season": int(history["season"].iat[-1]) + 1,
         "age_next": int(history["age"].iat[-1]) + 1,
+        "model": meta.get("served", "lstm"),
         "predicted_next_season": dict(zip(meta["stat_cols"], map(float, prediction), strict=True)),
         "last_season": dict(zip(meta["stat_cols"], map(float, history[meta["stat_cols"]].iloc[-1]),
                                 strict=True)),

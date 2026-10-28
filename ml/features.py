@@ -10,7 +10,7 @@ Sections:
 4. Career sequences: 4-season windows for the LSTM
 """
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import pandas as pd
@@ -65,9 +65,10 @@ class EloConfig:
     k: float = 20.0        # how fast ratings move
     hca: float = 100.0     # home-court advantage in Elo points (~64% between equal teams)
     carry: float = 0.75    # between seasons, ratings regress (1 - carry) toward the mean
+    hca_window: int = 0    # >0: each season's hca comes from the previous N seasons' home-win rate
 
 
-DEFAULT_ELO = EloConfig()
+DEFAULT_ELO = EloConfig(hca_window=5)  # tuned (B1): val log-loss 0.6316 vs 0.6404 with fixed hca=100
 PRIOR_GAMES = 10    # early-season stats are blended with last season as 10 pseudo-games
 REST_CAP = 7        # days of rest beyond a week don't matter
 
@@ -144,7 +145,7 @@ TEAM_FEATURES = ["elo", "w_pct", "net", "l10_w_pct", "l10_net", "prev_w_pct", "p
                  "gp", "rest", "b2b"]
 GAME_FEATURES = (
     [f"home_{f}" for f in TEAM_FEATURES] + [f"away_{f}" for f in TEAM_FEATURES]
-    + ["elo_diff", "net_diff", "w_pct_diff", "elo_prob", "is_playoff", "is_neutral"]
+    + ["elo_diff", "net_diff", "w_pct_diff", "elo_prob", "is_playoff", "home_court"]
 )
 
 
@@ -157,7 +158,7 @@ def matchup_features(home: dict, away: dict, is_playoff: bool, neutral: bool = F
     row["w_pct_diff"] = home["w_pct"] - away["w_pct"]
     row["elo_prob"] = elo_win_prob(home["elo"], away["elo"], hca=0.0 if neutral else elo.hca)
     row["is_playoff"] = int(is_playoff)
-    row["is_neutral"] = int(neutral)
+    row["home_court"] = 0 if neutral else 1  # +1 home, 0 neutral (-1 for mirrored training rows)
     return row
 
 
@@ -173,7 +174,9 @@ def build_game_features(games: pd.DataFrame, elo: EloConfig = DEFAULT_ELO) -> tu
     states: dict[str, TeamState] = {}
     current_abr: dict[str, str] = {}  # franchise -> abbreviation it used most recently
     snapshots: dict[tuple[int, str], dict] = {}
-    rows = []
+    rows, hcas = [], []
+    home_record: dict[int, list[int]] = {}  # season -> [home wins, games]
+    season_elo = elo
 
     def take_snapshots(season: int) -> None:
         for franchise, state in states.items():
@@ -186,6 +189,7 @@ def build_game_features(games: pd.DataFrame, elo: EloConfig = DEFAULT_ELO) -> tu
             if season is not None:
                 take_snapshots(season)
             season = g.season
+            season_elo = replace(elo, hca=seasonal_hca(home_record, season, elo))
         home_fr, away_fr = franchise_of(g.home_team), franchise_of(g.away_team)
         for franchise, abr in ((home_fr, g.home_team), (away_fr, g.away_team)):
             state = states.setdefault(franchise, TeamState(elo=elo.base))
@@ -195,10 +199,16 @@ def build_game_features(games: pd.DataFrame, elo: EloConfig = DEFAULT_ELO) -> tu
         home, away = states[home_fr], states[away_fr]
 
         rows.append(matchup_features(home.features(g.game_date), away.features(g.game_date),
-                                     is_playoff=g.game_type == "playoff", neutral=g.neutral, elo=elo))
+                                     is_playoff=g.game_type == "playoff", neutral=g.neutral,
+                                     elo=season_elo))
+        hcas.append(season_elo.hca)
         margin = int(g.home_score - g.away_score)
         home.elo, away.elo = elo_update(home.elo, away.elo, margin,
-                                        hca=0.0 if g.neutral else elo.hca, k=elo.k)
+                                        hca=0.0 if g.neutral else season_elo.hca, k=elo.k)
+        if not g.neutral and g.game_type == "regular":
+            home_record.setdefault(season, [0, 0])
+            home_record[season][0] += margin > 0
+            home_record[season][1] += 1
         home.record(g.game_date, margin)
         away.record(g.game_date, -margin)
     if season is not None:
@@ -206,7 +216,19 @@ def build_game_features(games: pd.DataFrame, elo: EloConfig = DEFAULT_ELO) -> tu
 
     features = pd.DataFrame(rows, index=games.index)
     features["target"] = games["home_win"].astype(int).values
+    features["hca"] = hcas  # the home advantage used for that game (needed again at inference)
     return features, snapshots
+
+
+def seasonal_hca(home_record: dict[int, list[int]], season: int, elo: EloConfig) -> float:
+    """Home advantage (Elo points) for `season`: fixed, or estimated from the home-win rate of
+    the previous `hca_window` seasons (inverse of Elo's formula: hca = 400 log10(p / (1 - p)))."""
+    past = [home_record[s] for s in range(season - elo.hca_window, season) if s in home_record]
+    games = sum(n for _, n in past)
+    if not elo.hca_window or games < 100:  # too few games to estimate: use the fixed value
+        return elo.hca
+    p = np.clip(sum(w for w, _ in past) / games, 0.01, 0.99)
+    return 400 * np.log10(p / (1 - p))
 
 
 # ================================================================ 3. similarity features
